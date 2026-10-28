@@ -133,6 +133,8 @@ def build_one(key: str, out_root: Path, py: str, date: str) -> int:
         cmd += ["--paths", str(REPO / "src" / "jianying-draft-toolkit" / "code")]
     if key == "re":
         cmd += ["--paths", str(REPO / "src" / "rename-unify" / "code")]
+    cmd += ["--collect-all", "webview", "--collect-all", "pythonnet"]
+    cmd += ["--hidden-import", "core_rules", "--hidden-import", "foldertree", "--hidden-import", "config", "--hidden-import", "naming_formats"]
     cmd += ["--exclude-module", "tkinter", "--exclude-module", "PyQt5",
             "--exclude-module", "IPython", "--exclude-module", "pytest"]
     cmd.append(str(entry_file))
@@ -168,6 +170,8 @@ def build_one(key: str, out_root: Path, py: str, date: str) -> int:
         print("[v4-pack] OK %s -> %s" % (key, zh_exe))
     else:
         print("[v4-pack] WARN %s: exe not found at %s" % (key, exe))
+    from finish_distribution import finish_distribution
+    finish_distribution(final, REPO, key)
     return 0
 
 
