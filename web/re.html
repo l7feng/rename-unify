@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-mode="dark" data-style="glass">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>统一命名工具 — v4 HTML 版</title>
+<link rel="icon" href="assets/logos/r.ico">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/rename-apple.css">
+</head>
+<body class="re-apple-ui">
+<div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+
+<!-- ① 头部：与 pt/剪映 壳同款 54px hero -->
+<header class="hero">
+  <img class="logo brand-mark" src="assets/logos/r.svg" alt="R">
+  <h1>统一命名工具</h1><span class="ver">版本</span>
+  <div class="spacer"></div>
+  
+  <button type="button" class="mode-sw" id="modeSw" title="切换主题">主题 · <span id="modeLabel">中性灰（深）</span></button>
+</header>
+
+<!-- ② 页签行 -->
+<nav class="tabs naming-nav" aria-label="工具导航"><button type="button" class="tab on" id="tab-run"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 4 12 8-12 8z"/></svg>批量分组改名</button><button type="button" class="tab" id="tab-folder"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2-3h9v16H3zM12 10v7m-4-3.5h8"/></svg>新建工程目录</button><span class="nav-gap" aria-hidden="true"></span><button type="button" class="tab auxiliary" id="tab-rule"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h8v4H8zM8 14h8M8 18h6"/><path d="M8 5H5v16h14V5h-3"/></svg>命名设置</button><button type="button" class="tab auxiliary" id="tab-target"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2-3h9v16H3zM8 13h8m-3-3 3 3-3 3"/></svg>分类与去向</button><button type="button" class="tab auxiliary" id="tab-undo"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 10 5-5m-5 5 5 5M3 10h11a6 6 0 1 1 0 12"/></svg>改名记录</button></nav>
+
+<main>
+  <!-- ══════════ 页 1：项目命名规则 ══════════ -->
+  <section class="page" id="page-rule">
+    <div class="cols eq">
+      <section class="card px-hl">
+        <h2>文件名格式 <span class="tag">用于批量分组改名</span></h2>
+        <div class="field"><label for="tplGlobal">文件名格式</label><input type="text" id="tplGlobal"></div>
+        <div class="format-fields" data-insert="tplGlobal" data-fields="片名,集数,日期,版本,用户,轨道信息,原始名"></div>
+        <div class="inner">实时样例：<code id="tplSample">—</code></div>
+        <div class="note">仅在勾选“文件改名”时生效；分类可以单独覆盖。</div>
+        <button class="btn primary sm" id="btnRuleSave">保存为默认</button>
+      </section>
+      <section class="card px-hl">
+        <h2>工程目录格式 <span class="tag">用于新建工程目录</span></h2>
+        <div class="field"><label for="cfgProjectFormat">项目根目录格式</label><input type="text" id="cfgProjectFormat" value="{片名}{等级}_{日期}_{用户}"></div>
+        <div class="format-fields" data-insert="cfgProjectFormat" data-fields="片名,等级,日期,用户"></div>
+        <div class="field"><label for="cfgEpisodeFormat">集数文件夹格式</label><input type="text" id="cfgEpisodeFormat" value="{片名} {集数}集"></div>
+        <div class="format-fields" data-insert="cfgEpisodeFormat" data-fields="片名,等级,集数,日期,用户"></div>
+        <div class="field"><label for="cfgEpisodePadding">集数位数</label><select id="cfgEpisodePadding"><option value="0">不补零</option><option value="2">两位</option><option value="3">三位</option></select></div>
+        <div class="note">与“新建工程目录”页同步；修改后自动记住。序号填写后自动加在项目根目录前。</div>
+        <div class="inner">实时样例：<code id="cfgEpisodeSample">—</code></div>
+      </section>
+    </div>
+    <details class="card legacy-formats"><summary>既有分类格式（兼容保留）</summary>
+      <div class="note">旧格式及分类绑定保留；通常直接编辑上方文件名格式，或在“分类与去向”单独设置。</div>
+        <div class="tbl-wrap" style="max-height:240px" id="tplTbl"><div class="empty">（加载中…）</div></div>
+        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+          <input type="text" id="tplNewName" placeholder="模板名" style="width:110px">
+          <input type="text" id="tplNewBody" placeholder="{片名} {集数}集 …" style="flex:1;min-width:180px">
+          <button class="btn ghost sm" id="btnTplAdd">＋ 添加</button>
+          <button class="btn ghost sm" id="btnTplReset">恢复出厂</button>
+        </div>
+    </details>
+  </section>
+
+  <!-- ══════════ 页 2：分类与去向 ══════════ -->
+  <section class="page" id="page-target">
+    <section class="card px-hl">
+      <h2>分类去向 <span class="tag">决定文件分类、放入目录和格式覆盖</span></h2>
+      <div class="tbl-wrap" id="tgtTbl"><div class="empty">（加载中…）</div></div>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn ghost sm" id="btnTgtAdd">＋ 添加目标</button>
+        <button class="btn ghost sm" id="btnTgtAllOn">全部启用</button>
+        <button class="btn ghost sm" id="btnTgtAllOff">全部停用</button>
+        <button class="btn ghost sm" id="btnTgtReset">恢复出厂</button>
+        <div style="flex:1"></div>
+        <button class="btn primary sm" id="btnTgtSave">保存为默认</button>
+      </div>
+      <div class="note">「集数」留空 = 全集都收；填 1-10,23 = 只收这些集。命名格式默认跟随文件名格式；需要特殊格式时选择“单独设置”。</div>
+    </section>
+  </section>
+
+  <!-- ══════════ 页 3：批量分组改名 ══════════ -->
+  <section class="page on" id="page-run">
+    <div class="action-toolbar" role="group" aria-label="批量分组改名操作">
+      <div class="action-buttons">
+        <fieldset class="plan-mode" aria-label="选择计划模式">
+          <legend class="visually-hidden">选择计划模式</legend>
+          <input class="plan-mode-radio" type="radio" name="planMode" id="planModeAll" value="all" checked>
+          <input class="plan-mode-radio" type="radio" name="planMode" id="planModeMaster" value="master-only">
+          <div class="plan-mode-track">
+            <span class="plan-mode-indicator" aria-hidden="true"></span>
+            <label class="plan-mode-option" for="planModeAll" id="btnPlan">生成计划</label>
+            <label class="plan-mode-option" for="planModeMaster" id="btnMasterOnly" title="仅重命名 Master 文件，不移动或打包其他文件">仅命名 Master（不打包）</label>
+          </div>
+        </fieldset>
+        <button class="btn ghost sm" id="btnCancelPlan" type="button" hidden disabled>取消本次计划</button>
+        <button class="btn primary" id="btnApply" disabled>▶ 执行重命名</button>
+      </div>
+      <span class="toolbar-hint" id="runModeHint" role="status" aria-live="polite">先生成计划，再执行。</span>
+    </div>
+    <div class="cols eq">
+      <section class="card px-hl">
+
+        <div class="field"><label>目标目录</label>
+          <input type="text" id="runRoot" placeholder="工程导出目录">
+          <button class="btn ghost sm" id="runBrowseRoot">浏览…</button>
+        </div>
+        <details id="runScanDetails" class="setting-fold"><summary>扫描选项<span class="fold-value" id="runScanSummary" data-i18n-data></span></summary>
+        <div class="field"><label>扩展名</label>
+          <input type="text" id="runExts" value=".wav .aif .aiff .mp3 .flac .w64">
+        </div>
+        <label class="check"><input type="checkbox" id="runRecursive" checked><span>含子目录</span></label>
+        <label class="check"><input type="checkbox" id="runMtime" checked><span>日期用文件修改时间兜底（源名/目录都没有日期时）</span></label>
+        </details>
+        <label class="check"><input type="checkbox" id="runRenameDirs" checked><span>分组文件夹改名</span></label>
+        <details id="runGroupDetails" class="setting-fold"><summary>分组文件夹格式<span class="fold-value" id="runGroupSummary" data-i18n-data></span></summary>
+        <div class="field"><label for="runDirFormat">分组文件夹格式</label><input type="text" id="runDirFormat" value="{集数}"></div>
+        <div class="format-fields" data-insert="runDirFormat" data-fields="片名,集数,日期,版本,用户"></div>
+        <div class="inner">实时样例：<code id="runDirSample">24</code></div>
+        </details>
+        <label class="check"><input type="checkbox" id="runGroupMaster" checked><span>Master（MIX）参与打包分组</span></label>
+        <div class="note">取消后 Master 留在原目录；是否改名仍由“文件改名”控制。</div>
+        <label class="check"><input type="checkbox" id="runRenameSubtracks" checked><span>BUS 和分轨也改名</span></label>
+        <div class="note">关闭后仅 Master 改名；BUS 和分轨保留文件名，仍按分组设置归位。版本优先读取同集 Master，缺失时使用 V01。</div>
+        <label class="check"><input type="checkbox" id="runRenameFiles"><span>文件改名</span></label>
+        <details id="runFileDetails" class="setting-fold"><summary>文件名格式<span class="fold-value" id="runFileModeSummary" data-i18n-data></span></summary>
+                <div class="inner">当前文件格式：<code id="runFileSummary">—</code><button type="button" class="btn ghost sm" id="editFileFormat">编辑格式</button></div>
+          <div class="note">文件改名关闭时保持原名；开启后按当前格式和分类覆盖处理。</div>
+        </details>
+        <details id="batchProjectDetails" class="setting-fold">
+          <summary>项目信息（可选）</summary>
+          <div class="note">用于补充文件名中缺失的信息；与新建工程目录独立。</div>
+        <div class="field"><label>片名</label><input type="text" id="fProject" value=""></div>
+        <div class="field"><label>日期</label><input type="text" id="fDate" value="" placeholder="如 0922"></div>
+        <div class="field"><label>版本</label><input type="text" id="fVer" value="" placeholder="如 V01"></div>
+        <div class="field"><label>用户</label><input type="text" id="fUser" value="" placeholder="如 7F"></div>
+        </details>
+        <div class="note">默认只调整分组文件夹，文件名保持原样；两个开关可以独立选择。新分组建立后，原空目录仅提示，不自动删除。</div>
+
+        <div class="note">执行前自动保存恢复记录；需要恢复原名时，打开「改名记录」。</div>
+      </section>
+      <section class="card px-hl">
+        <h2>改名预览 <span class="tag" id="planTag">待处理 0</span></h2>
+        <div class="tbl-wrap" style="max-height:420px" id="planTbl"><div class="empty">（先选目录，点「生成计划」）</div></div>
+        <div id="manualBox" style="display:none;margin-top:10px">
+          <b style="font-size:12.5px">手动分类 <span style="color:var(--faint);font-size:11px" id="manualFile"></span></b>
+          <div class="field"><label>集数</label><input type="text" id="manEp" placeholder="如 13"></div>
+          <div class="field"><label>目标</label><input type="text" id="manTarget" placeholder="MIX / BUS / STEM / AIFX"></div>
+          <div class="field"><label>轨道信息</label><input type="text" id="manInfo" placeholder="如 DX BUS（留空自动）"></div>
+          <div style="display:flex;gap:8px">
+            <button class="btn primary sm" id="btnManOk">✓ 重算落点</button>
+            <button class="btn ghost sm" id="btnManCancel">取消</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ══════════ 页 4：撤销改名 ══════════ -->
+  <section class="page" id="page-undo">
+    <div class="cols eq">
+      <section class="card px-hl">
+        <h2>改名记录 <span class="tag">rename_log_*.csv（执行成功后生成）</span></h2>
+        <div class="field"><label>目标目录</label>
+          <input type="text" id="undoRoot" placeholder="与「批量分组改名」页同一目录">
+          <button class="btn ghost sm" id="undoBrowseRoot">浏览…</button>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn ghost sm" id="btnListLogs">列日志</button>
+          <button class="btn ghost sm" id="btnListAudits">列审计快照</button>
+        </div>
+        <div class="tbl-wrap" style="max-height:220px;margin-top:8px" id="logTbl"><div class="empty">（点「列日志 / 列审计快照」）</div></div>
+        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+          <button class="btn ghost sm" id="btnLogPreview" disabled>预览内容</button>
+          <button class="btn ghost sm" id="btnUndoDry" disabled>预演撤销</button>
+          <button class="btn danger sm" id="btnUndoRun" disabled>↩ 执行撤销</button>
+        </div>
+      </section>
+      <section class="card px-hl">
+        <h2>内容预览 <span class="tag">原文件 ⇄ 新文件（倒序回滚，防同名交叉）</span></h2>
+        <div class="tbl-wrap" style="max-height:400px" id="logPreview"><div class="empty">（选中一份日志/审计后点「预览内容」）</div></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ══════════ 页 5：新建工程目录 ══════════ -->
+  <section class="page" id="page-folder">
+    <div class="action-toolbar" role="group" aria-label="新建工程目录操作">
+      <div class="action-buttons">
+          <button class="btn ghost sm" id="btnFtInfer">从上次项目提取</button>
+          <button class="btn ghost" id="btnFtPlan"> 刷新预览</button>
+          <button class="btn ghost sm" id="btnFtPrecheck"> 预检</button>
+          <button class="btn primary" id="btnFtBuild">开始建立</button>
+        </div>
+    </div>
+    <div class="cols eq">
+      <section class="card px-hl">
+        <h2>工程目录设置</h2>
+        <details class="setting-fold" id="ftTemplateDetails"><summary>工程文件夹模板路径<span class="fold-value" id="ftTemplateSummary" data-i18n-data></span></summary>
+        <div class="field"><label>工程文件夹模板路径</label>
+          <input type="text" id="ftTplRoot" placeholder="…\00文件夹模板">
+          <button class="btn ghost sm" id="ftBrowseTpl">浏览…</button>
+        </div>
+        <div class="note">选择包含“文件夹模板”和“Project模板”的上一层目录。</div>
+        </details>
+        <div class="field" id="ftOutputField"><label for="ftOutRoot">输出路径</label>
+          <input type="text" id="ftOutRoot" aria-describedby="ftDropHint ftDropStatus" placeholder="输入输出路径，或拖入工程文件夹">
+          <button class="btn ghost sm" id="ftBrowseOut">浏览…</button>
+        </div>
+        <label class="check"><input type="checkbox" id="ftDropParent" checked><span>输出到工程根的父级</span></label>
+        <div class="note" id="ftDropHint">勾选时输出到工程根的父级；取消时输出到工程根。普通目录直接作为输出路径。</div>
+        <div class="note" id="ftDropStatus" role="status" aria-live="polite" data-i18n-data></div>
+        <div class="field"><label>项目名 / 序号</label>
+          <input type="text" id="ftName" placeholder="如 测试">
+          <input type="text" id="ftSeq" placeholder="留空=无前缀">
+        </div>
+        <div class="field"><label>等级 / 日期 / 用户</label>
+          <input type="text" id="ftLevel" placeholder="如 D" style="width:70px">
+          <input type="text" id="ftDate" placeholder="如 0929" style="width:90px">
+          <input type="text" id="ftUser" placeholder="如 7F" style="width:70px">
+        </div>
+        <div class="field"><label>集数</label>
+          <input type="text" id="ftEps" value="1-10" placeholder="如 1-10，23、38（支持 , ，、）">
+        </div>
+        <details class="setting-fold" id="ftProjectDetails"><summary>项目根目录格式<span class="fold-value" id="ftProjectSummary" data-i18n-data></span></summary>
+        <div class="field"><label for="ftProjectFormat">项目根目录格式</label><input type="text" id="ftProjectFormat" value="{片名}{等级}_{日期}_{用户}"></div>
+        <div class="format-fields" data-insert="ftProjectFormat" data-fields="片名,等级,日期,用户"></div>
+        </details>
+        <details class="setting-fold" id="ftEpisodeDetails"><summary>集数文件夹格式<span class="fold-value" id="ftEpisodeSummary" data-i18n-data></span></summary>
+        <div class="field"><label for="ftEpFormat">集数文件夹格式</label><input type="text" id="ftEpFormat" value="{片名} {集数}集"></div>
+        <div class="format-fields" data-insert="ftEpFormat" data-fields="片名,等级,集数,日期,用户"></div>
+        <div class="format-presets"><span>快捷填入</span><button type="button" class="btn ghost sm" data-ep-format="{集数}">纯数字</button><button type="button" class="btn ghost sm" data-ep-format="{片名} {集数}集">片名＋集数</button><button type="button" class="btn ghost sm" data-ep-format="{片名}{等级}{集数}">片名＋等级＋集数</button></div>
+        <div class="field"><label for="ftEpPadding">集数位数</label><select id="ftEpPadding"><option value="0">不补零</option><option value="2">两位</option><option value="3">三位</option></select></div>
+        <div class="inner">实时样例：<code id="ftNameSample">—</code></div>
+        </details>
+        <details class="setting-fold" id="ftFileDetails"><summary>工程文件格式<span class="fold-value" id="ftFileSummary"></span></summary>
+        <div class="field"><label>工程文件处理</label><select id="ftPtx"></select></div>
+        <div class="note">重命名时，PTX工程文件与集数文件夹同名，不修改工程内容。</div>
+        </details>
+        <label class="check"><input type="checkbox" id="ftSkip" checked><span>跳过已存在的文件夹</span></label>
+
+        <div class="note">集数文件夹建在 Project 子目录下；格式与“命名设置”同步，预检通过后再建立。</div>
+      </section>
+      <section class="card px-hl">
+        <h2>目录树预览 <span class="tag" id="ftExample">规划中</span></h2>
+        <pre id="ftPreview" class="inner" style="font-size:11.5px;max-height:440px;overflow:auto;white-space:pre">（点「刷新预览」）</pre>
+      </section>
+    </div>
+  </section>
+
+  <!-- ⑤ 日志区（五页共用） -->
+  <div class="logwrap">
+    <div class="loghead">
+      <b>运行日志</b><span class="cnt" id="logCnt">（0 条）</span>
+      <div class="spacer"></div>
+      <span style="font-size:11px;color:var(--faint)">改名执行/建树在后台线程，完成有 ✓/✗ 尾行</span>
+    </div>
+    <div class="log" id="log"><div class="info">— 就绪。等待操作 —</div></div>
+    <div class="log-actions">
+      <button class="btn ghost sm" id="btnClear">清空日志</button>
+    </div>
+  </div>
+</main>
+
+<!-- ⑥ 状态条 -->
+<footer class="status">
+  <span><span class="dot off" id="planDot"></span><span id="planText">尚未生成计划</span></span>
+  <div class="spacer"></div>
+  <span class="badge" id="envBadge">就绪</span>
+</footer>
+
+<div class="demo-tip" id="demoTip" style="display:none">演示态（未检测到壳桥接）· 外观预览可用</div>
+
+<script src="js/i18n.js"></script>
+<script src="js/preferences.js"></script>
+<script src="js/re.js"></script>
+<script src="js/glass-tuner.js"></script>
+<script src="js/rename-apple.js"></script>
+<script src="js/re-folder-drop.js"></script>
+</body>
+</html>

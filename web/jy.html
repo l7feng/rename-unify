@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-mode="dark" data-style="glass">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>剪映工程工具包</title>
+<link rel="icon" href="assets/logos/j.ico"><link rel="stylesheet" href="assets/style.css"><link rel="stylesheet" href="assets/rename-apple.css"><link rel="stylesheet" href="assets/jy-workbench.css"></head>
+<body class="re-apple-ui jy-calm-ui">
+<div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+<header class="hero"><img class="logo brand-mark" src="assets/logos/j.svg" alt=""><h1>剪映工程工具包</h1><span class="ver">H版 v4.3.0</span><div class="spacer"></div><button type="button" class="mode-sw" id="modeSw">主题 · <span id="modeLabel">中性灰（深）</span></button></header>
+<nav class="tabs naming-nav" aria-label="工具导航"><button type="button" class="tab on" id="tab-import">导入音频</button><button type="button" class="tab" id="tab-export">导出音频</button><button type="button" class="tab" id="tab-sep">人声分离</button><span class="nav-gap spacer"></span><button type="button" class="tab auxiliary" id="tab-ofx">管理 OFX</button></nav>
+<main>
+<div class="task-status" id="taskStatus" role="status" aria-live="polite">就绪，选择一项操作。</div>
+<div class="warn" id="warnBar" style="display:none">环境存在缺项，请展开运行记录查看自检结果。</div>
+<section class="page on" id="page-import">
+<div class="page-heading"><h2>把混音音频放回剪映</h2><p>选择交付清单与目标草稿，预览后再写入。</p></div>
+<div class="cols jy-import-grid"><section class="card"><h2>选择文件</h2>
+<div class="field"><label for="impJson">交付清单</label><input type="text" id="impJson" placeholder="选择 pt-clips.json"><button class="btn ghost sm" id="impBrowseJson">选择文件</button></div>
+<div class="field"><label for="impDraft">目标草稿</label><input type="text" id="impDraft" placeholder="选择具体一集的草稿文件夹"><button class="btn ghost sm" id="impBrowseDraft">选择目录</button></div>
+<details class="jy-options"><summary>轨道筛选</summary><div class="field"><label for="impOnly">指定轨道</label><input type="text" id="impOnly" placeholder="留空导入全部；多个轨名用逗号分隔"></div><label class="check"><input type="checkbox" id="impKeepAux"><span>同时导入辅助轨</span></label></details>
+<div class="action-toolbar"><button class="btn ghost" id="btnImpPreview">预览轨道</button><button class="btn primary" id="btnImpRun">开始导入</button></div>
+<p class="note">写入前请保存并关闭剪映。</p>
+<details class="jy-help"><summary>交付清单从哪里来？</summary><p>在 Pro Tools 工具箱生成交付包，使用其中的 pt-clips.json 和音频目录。这里读取已有清单，预览本身不要求 Pro Tools 在线。</p></details>
+</section><section class="card"><h2>轨道预览</h2><div id="impInfo" class="note">尚未预览</div><div class="tbl-wrap" id="impTracks"><div class="empty">选择文件后，点击“预览轨道”。</div></div></section></div>
+</section>
+<section class="page" id="page-export">
+<div class="page-heading"><h2>从剪映导出音频</h2><p>选择来源、输出位置和导出方式。</p></div>
+<section class="card jy-export-form"><h2>导出任务</h2>
+<div class="field"><label for="expInput">输入目录</label><input type="text" id="expInput" placeholder="单集草稿或草稿库；留空使用默认位置"><button class="btn ghost sm" id="expBrowseInput">选择目录</button></div>
+<div class="field"><label for="expOut">输出目录</label><input type="text" id="expOut" placeholder="选择音频保存位置"><button class="btn ghost sm" id="expBrowseOut">选择目录</button></div>
+<div class="field"><label>导出方式</label><div class="jy-mode-options"><label class="check"><input type="checkbox" id="mdTracks" checked><span>整轨 WAV</span></label><label class="check"><input type="checkbox" id="mdClips"><span>独立片段</span></label></div></div>
+<div class="field" data-export-feature="tracks"><label for="expSpec">整轨规格</label><select id="expSpec"><option value="keep">保持素材规格</option></select></div>
+<details class="jy-options"><summary>指定多个输入路径</summary><textarea id="expPaths" rows="3" aria-label="多个输入路径" placeholder="每行一个草稿文件夹或音视频文件；填写后优先使用这些路径"></textarea></details>
+<details class="jy-options"><summary>命名与文件处理</summary>
+<div class="field" data-export-feature="tracks"><label for="expTrackTpl">整轨命名</label><input type="text" id="expTrackTpl" value="{项目名}_{轨道名}"></div>
+<div class="field"><label for="expRemarks">命名备注</label><input type="text" id="expRemarks" placeholder="可选，写入命名模板中的备注"></div>
+<div class="field"><label for="expConflict">文件重名</label><select id="expConflict"><option value="rename">自动重命名，保留两份</option><option value="cover">覆盖同名文件</option><option value="skip">跳过</option></select></div>
+<label class="check"><input type="checkbox" id="expVideoTracks" checked><span>提取视频原声</span></label><label class="check"><input type="checkbox" id="expSkipExisting"><span>跳过上轮已导出的草稿</span></label>
+</details>
+<details class="jy-options" data-export-feature="clips"><summary>片段设置</summary><div class="field"><label for="expFmt">音频格式</label><select id="expFmt"><option value="wav">WAV</option><option value="mp3">MP3</option></select><select id="expBitrate" aria-label="MP3码率"><option>320</option><option>256</option><option>192</option><option>128</option></select></div><div class="field"><label for="expClipType">素材分类</label><input type="text" id="expClipType" placeholder="自动判定，或填写 DX / FX / MX"></div><label class="check"><input type="checkbox" id="expDedupe" checked><span>同一素材的相同区段只输出一次</span></label></details>
+<details class="jy-options"><summary>附加交付</summary><div data-export-feature="tracks"><label class="check"><input type="checkbox" id="expAaf"><span>同时生成 AAF</span></label><div class="field" data-export-feature="aaf"><label for="expAafMode">AAF媒体</label><select id="expAafMode"><option value="media">内嵌音频，并保留素材副本</option><option value="embed">内嵌音频，不保留额外副本</option></select></div><label class="check"><input type="checkbox" id="expSplit"><span>按视频片段分包</span></label><div class="field" data-export-feature="split"><label for="expSplitTpl">分包命名</label><input type="text" id="expSplitTpl" value="{视频名}"></div></div><label class="check"><input type="checkbox" id="expSubs"><span>导出字幕</span></label><p class="note">每个视频片段各一个包；不自动判定剧集边界。</p></details>
+<div class="action-toolbar"><button class="btn ghost" id="btnPhase1">解析输入</button><button class="btn primary" id="btnExportRun" disabled>开始导出</button><span class="spacer"></span><button class="btn ghost sm" id="btnOpenOut">打开输出</button><button class="btn ghost sm" id="btnEnvCheck">环境自检</button></div><p class="note" id="exportHint">先解析输入，核对后开始导出。</p>
+<div id="pendingBox" style="display:none"><h2>补充分包名称</h2><p id="pendingHint" class="note"></p><div id="pendingList"></div><button class="btn primary" id="btnPendingOk">确认名称并导出</button></div>
+</section></section>
+<section class="page" id="page-sep"><div class="page-heading"><h2>人声与伴奏分离</h2><p>选择音频，输出人声及伴奏文件。</p></div><section class="card jy-export-form"><div class="field"><label for="sepIn">输入音频</label><input type="text" id="sepIn" placeholder="WAV、MP3、M4A 或 FLAC"><button class="btn ghost sm" id="sepBrowseIn">选择文件</button></div><div class="field"><label for="sepOut">输出目录</label><input type="text" id="sepOut" placeholder="留空保存到输入旁的 separated 文件夹"><button class="btn ghost sm" id="sepBrowseOut">选择目录</button></div><div class="field"><label>分离方式</label><div class="jy-mode-options"><label class="check"><input type="radio" name="sepStems" value="vocals" checked><span>人声 / 伴奏</span></label><label class="check"><input type="radio" name="sepStems" value="all"><span>四轨</span></label></div></div><div id="sepEnv" class="note">模型尚未检测</div><div class="action-toolbar"><button class="btn primary" id="btnSepRun">开始分离</button><button class="btn ghost sm" id="btnSepOpen">打开输出</button><span class="spacer"></span><button class="btn ghost sm" id="btnSepRecheck">检测模型</button></div><details class="jy-help"><summary>模型与输出说明</summary><p>使用现有 Demucs 环境。四轨为人声、鼓、贝斯和其他；首次加载模型可能较慢。</p></details></section></section>
+<section class="page" id="page-ofx"><div class="page-heading"><h2>管理 OFX</h2><p>安装或移除剪映缓存中的插件副本。</p></div>
+<section class="card"><h2>安装插件</h2><div class="field"><label for="ofxSource">插件来源</label><input type="text" id="ofxSource" placeholder="选择完整 .ofx.bundle 文件夹或 .ofx 文件"><button class="btn ghost sm" id="ofxBrowseBundle">选择文件夹</button><button class="btn ghost sm" id="ofxBrowseFile">选择文件</button></div><div class="action-toolbar"><button class="btn primary" id="btnOfxInstall">导入插件</button><span class="note" id="ofxProcessState" role="status">正在检查剪映状态…</span></div></section>
+<section class="card jy-plugin-section"><div class="jy-section-head"><h2>已安装的缓存副本 <span class="tag" id="ofxCount">0 个</span></h2><button class="btn ghost sm" id="btnOfxRefresh">刷新列表</button></div><div id="ofxList" class="jy-plugin-list"><div class="empty">正在读取插件缓存…</div></div><details class="jy-help"><summary>安装位置与使用说明</summary><p id="ofxRoot" class="jy-path"></p><button class="btn ghost sm" id="btnOfxOpenRoot">打开缓存目录</button><p>安装和删除前请保存并完全退出剪映。导入只复制插件，不运行插件代码；重启剪映后确认插件是否显示。若未显示，请使用剪映原生导入。</p><p>删除移入回收站，不删除源插件。已有工程中的对应效果可能提示缺失。</p></details></section></section>
+<details class="logwrap jy-run-details" id="runDetails"><summary class="loghead"><b>运行记录</b><span class="cnt" id="logCnt">（0 条）</span></summary><div class="log" id="log"><div class="info">就绪。</div></div><div class="log-actions"><button class="btn ghost sm" id="btnClear">清空记录</button></div></details>
+</main>
+<footer class="status"><span id="ptStatusWrap"><span class="dot off" id="ptDot"></span><span id="ptText">Pro Tools 状态未检测</span></span><div class="spacer"></div><span class="badge" id="envBadge">环境未检</span></footer>
+<dialog id="ofxDeleteDialog" aria-labelledby="ofxDeleteTitle"><h2 id="ofxDeleteTitle">移除插件？</h2><p id="ofxDeleteName"></p><p id="ofxDeletePath" class="jy-path"></p><p id="ofxDeleteSize" class="note"></p><p class="note">仅移除剪映缓存副本并移入回收站。已有工程中的该效果可能提示缺失。</p><div class="action-toolbar"><button class="btn ghost" id="ofxDeleteCancel">取消</button><button class="btn danger" id="ofxDeleteConfirm">移入回收站</button></div></dialog>
+<div class="demo-tip" id="demoTip" style="display:none">浏览器预览 · 文件操作请使用 EXE</div>
+<script src="js/i18n.js"></script><script src="js/preferences.js"></script><script src="js/jy.js"></script><script src="js/glass-tuner.js"></script>
+</body></html>

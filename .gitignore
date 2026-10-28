@@ -1,0 +1,77 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec
+
+# ===== 虚拟环境 =====
+# 注：pt-exporter/env/ 是源码目录（调试探针脚本），不是虚拟环境，故只忽略 venv
+# 注意：不要写 ENV/ —— Windows 下 git 不区分大小写，会连 env/ 一起忽略
+venv/
+.venv/
+src/**/env/venv/
+src/**/env/Scripts/
+src/**/env/pyvenv.cfg
+
+# ===== 本地配置 / 环境变量 =====
+.env
+*.local.json
+config.local.json
+
+# ===== W4 便携配置（exe 旁 = 源码模式 src/pt-tools/）=====
+# 个人配置与日志只落本机，不入库 —— 测试跑 App 时 W4 迁移会真实复制
+# %APPDATA% 配置过来，必须忽略，否则用户个人配置会被提交进仓库。
+src/pt-tools/config.json
+src/pt-tools/pt-tools.log*
+src/pt-tools/pt-batch-*.log
+src/pt-tools/pt-tools-diag-*.zip
+
+# ===== PyInstaller =====
+# 注：*.spec 由 build.ps1 自动重生成，无需入库
+*build.log
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 临时 / 备份 =====
+*.tmp
+*.bak
+*.log
+
+# ===== 保留：工具依赖的第三方 exe（jy-draftc）=====
+!src/jianying-draft-toolkit/tools/jy-draftc/jy-draftc-amd64-windows/jy-draftc.exe
+
+
+# ===== 2026-09-28 配置卫生：个人运行期配置一律不入库 =====
+# src/jianying-draft-toolkit/config.json 曾是运行期 config（含作者机器路径），
+# 2026-09-28 从跟踪移除 —— 工具源码模式首次运行会自动生成（见 core/config.py）。
+src/jianying-draft-toolkit/config.json
+src/jianying-draft-toolkit/code/config.json
+src/rename-unify/config.json
+# v3.14.0 产物归拢：exe 体积大，本地可见但不入库
+release/exe/
+
+# v4 打包工作目录（PyInstaller 中间产物，不入库）
+tools/v4_pack/_build_*/
+src/rename-unify/code/config.json
+
+# 分仓准备：不将本机环境或构建中间物纳入发布
+.env
+**/.env
+**/_build_*/
+build/
+dist/
+*.local.json
+*sync-conflict*
+*.log
+*.toc

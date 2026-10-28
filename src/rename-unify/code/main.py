@@ -1,0 +1,2077 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""统一命名工具 (rename-unify) —— 音效/影视交付文件批量命名统一
+
+设计原则
+--------
+壳不动芯：所有识别与重命名逻辑只在 core_rules.py 里维护，
+GUI 只负责收集参数 → 调 core → 展示计划。core 可独立跑测试。
+
+标签页按「使用人 × 前置条件」切分：
+  页1「项目信息与模板」—— 字段值 + 模板库，无前置条件
+  页2「目标与归位」    —— 每个目标放哪、用哪套模板、处理哪些集，无前置条件
+  页3「预览与执行」    —— 需要先选目录；识别失败的可在计划表里「手动分类」
+  页4「回溯与撤销」    —— 需要有一份 rename_log
+
+v1.2.0 变更（2026-09-23）
+   * 「命名清单」升级为**目标表**：目标（MIX / BUS / STEM / AIFX）各自绑定
+     归位目录 + 一套模板 —— 这就是「模板和目标拆开」：Master 走全格式，
+     BUS/STEM 可以走短格式，各改各的。
+   * 模板库可增删改（页1），目标从库里**选一套**（页2）。
+   * `{档位}` → `{用户}`（AB 是用户代号）。旧配置自动迁移，不静默丢。
+   * 原「按集归位」独立步骤已**内联**进主流程（目标表的「归位目录」决定最终
+     落点，平铺的分类目录会被自动重组为集目录），故页3 不再有该区块。
+   * 识别失败的项可在页3「手动分类」：指定 集数 + 目标 + 轨道信息，重算落点。
+
+零第三方依赖（仅标准库 + tkinter）。
+
+用法：python main.py
+"""
+import os
+import re
+import sys
+import datetime
+import json
+import threading
+import traceback
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+from scrollable import ScrollableFrame  # G2/J12：页内可滚动容器（同源副本，改一处同步三处）
+from columns import fit_tree_columns  # S11：表格列宽按权重自适应（同源副本，改一处同步两处）
+from theme import (apply as apply_theme, initial_geometry, set_theme,
+    list_themes, current_theme_name, buttonize, DEFAULT_THEME,
+    set_button_style, list_button_styles, current_button_style, recolor,
+    PAD_SM, PAD_MD, PAD_LG,   # v3.12.1：HeroHeader 接线时 _build_ui 已引用，此前漏 import（冒烟抓到）
+    ICON_PLAY, ICON_CROSS, ICON_PLUS, ICON_REFRESH, ParticleCanvas, FONT_SMALL)  # S13/S12：共享主题与窗口几何（同源副本）
+from widgets import (StatusLED, Tooltip, CollapsibleFrame, IconButton, ToggleSwitch,
+    Badge, ProgressRing, attach_tree_hover, attach_drop_highlight, attach_tooltip,
+    HoverCard, draw_icon, auto_tooltip, HeroHeader, Segmented, GlassCard, PixelCard,
+    refresh_cards)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import config as CFG
+import core_rules as CORE
+# v1.7.0（D 档合并 F7+R2）：原 pt-project-folder-builder 的建树逻辑，
+# 纯逻辑层（零 tkinter），GUI 只收集参数后调用。
+import foldertree as FT
+
+
+# ---------------------------------------------------------------------------
+# G1（v2.6.6 / B批）：拖拽支持 —— tkinterdnd2 缺席时安全回退（无拖拽，不报错）
+# ---------------------------------------------------------------------------
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES as _DND_FILES
+    _TKDND_OK = True
+except ImportError:
+    TkinterDnD = None
+    _TKDND_OK = False
+
+
+def split_dnd_data(data):
+    """tkinterdnd2 的 drop 数据 → 路径列表（含空格路径是 {..} 花括号包裹）。"""
+    out = []
+    for tok in re.findall(r"\{[^}]*\}|\S+", data or ""):
+        out.append(tok.strip("{}"))
+    return [p for p in out if p]
+
+
+def enable_path_drop(entry, on_drop):
+    """给 Entry 注册文件夹/文件拖入；拖入后回调 on_drop(路径列表)。
+
+    tkinterdnd2 不可用（未安装/打包未带）时静默跳过，保持原有无拖拽行为。
+    """
+    if not _TKDND_OK:
+        return False
+
+    def _handle(e):
+        paths = split_dnd_data(e.data)
+        if paths:
+            on_drop(paths)
+        return e.action
+
+    entry.drop_target_register(_DND_FILES)
+    entry.dnd_bind("<<Drop>>", _handle)
+    return True
+
+
+# --- windowed 模式下 stdout/stderr 可能是 None，任何 print 都会崩 ---
+def _safe_io():
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            try:
+                setattr(sys, name, open(os.devnull, "w", encoding="utf-8",
+                                        errors="replace"))
+            except OSError:
+                pass
+        elif hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+COLOR_OK = "#2e7d32"
+COLOR_BAD = "#c62828"
+COLOR_WARN = "#ef6c00"
+COLOR_HINT = "#1565c0"
+
+# 计划表每行的状态 -> 颜色
+STATUS_COLOR = {
+    "": COLOR_OK,           # 待改名（正常）
+    "rename": COLOR_OK,
+    "skip": "#757575",      # 已是目标命名
+    # v3.14.0 P0-C1：识别失败常是整页几百行（素材语义文件名本就不该按
+    # 项目规则识别）——鲜红 #c62828 满屏轰炸，降为暗砖红保留警示。
+    "error": "#a65d52",     # 识别失败
+    "conflict": COLOR_WARN,  # 命名冲突
+    "excluded": "#8e24aa",   # 目标未启用 / 集数不在限定范围
+}
+STATUS_TEXT = {
+    "": "待改名",
+    "rename": "待改名",
+    "skip": "已合规",
+    "error": "识别失败",
+    "conflict": "命名冲突",
+    "excluded": "按目标排除",
+}
+
+# 页2 模板列的两个特殊值
+TPL_GLOBAL = "（用兜底模板）"
+
+
+class QueueWriter(object):
+    """把 core 的 print 搬上界面（线程安全）。"""
+
+    def __init__(self, q):
+        self.q = q
+
+    def write(self, s):
+        if s:
+            self.q.put(s)
+
+    def flush(self):
+        pass
+
+
+class App(TkinterDnD.Tk if _TKDND_OK else tk.Tk):
+    def __init__(self):
+        super().__init__()
+        # 三重保险消除 Tk 启动闪窗
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-alpha", 0.0)
+
+        try:
+            ttk.Style(master=self).configure("Hint.TLabel", foreground=COLOR_HINT)
+            ttk.Style(master=self).configure("Ok.TLabel", foreground=COLOR_OK)
+            ttk.Style(master=self).configure("Bad.TLabel", foreground=COLOR_BAD)
+            ttk.Style(master=self).configure("Warn.TLabel", foreground=COLOR_WARN)
+        except tk.TclError:
+            pass
+
+        self.cfg = CFG.load_config()
+        self.items = []          # 当前计划
+        self.stats = {}
+        self._last_stats_sig = None   # R2：统计行只在扫描结果变化时输出一次
+        self.last_log = ""
+        self.busy = False
+        # 手动分类：{normcase(src): {"ep":..., "target":..., "info":...}}
+        # 为什么单独存：识别失败的项重算计划时会重新变回 error，
+        # 存成覆盖表才能让用户的手工指定在多次「生成计划」之间保持住。
+        self.manual = {}
+
+        self._load_targets_and_templates()
+        # v3.14.0 C：button_style 进启动链（对齐 pt-tools A1 / 剪映 B 同款修复）——
+        # 旧版只传 theme，_state 恒回默认：重启后风格档案回退。
+        apply_theme(self, theme_name=self.cfg.get("theme"),
+                    button_style=self.cfg.get("button_style"))   # S13：共享主题（读 cfg["theme"]，默认 warm）
+        buttonize(self)   # S13-v2：按钮悬停变手型
+        # S13-v3：动态像素粒子背景（底层）
+        self.particle = ParticleCanvas(self, enabled=bool(self.cfg.get("particle_bg", True)),
+                                        theme_name=self.cfg.get("theme"))
+        self.particle.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.tk.call("lower", str(self.particle))
+        self._build_menubar()   # v3.13.0 B2：先于 _build_ui（菜单挂 root）
+        self._build_ui()
+
+        self.title(CFG.title())
+        # S12：窗口几何统一 —— cfg 有记录用记录（钳到 minsize），无记录按屏幕自适应
+        # （替代旧固定 1280x820；minsize 880x560 → 900x620 与三工具统一）
+        self.geometry(initial_geometry(self.cfg.get("window"), self))
+        self.minsize(900, 620)
+
+        self._center_on_screen()
+        self.overrideredirect(False)
+        self.attributes("-alpha", 1.0)
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+        self._refresh_preview()
+
+    # ------------------------------------------------------------------
+    # 配置装载（含 v1.1.0 → v1.2.0 迁移）
+    # ------------------------------------------------------------------
+    def _load_targets_and_templates(self):
+        """载入模板库与目标表，并迁移旧版「命名清单」。"""
+        self.templates = [dict(t) for t in
+                          (self.cfg.get("templates") or CORE.DEFAULT_TEMPLATES)]
+        if not self.templates:
+            self.templates = [dict(t) for t in CORE.DEFAULT_TEMPLATES]
+
+        tgts = self.cfg.get("targets") or []
+        if not tgts and self.cfg.get("enabled_types"):
+            # v1.1.0 的「命名清单」（BUS-DX / STEM-MX-* …）折成目标表
+            tgts = CORE.migrate_enabled_types(self.cfg["enabled_types"])
+        self.targets = CORE.normalize_targets(tgts)
+
+    # ------------------------------------------------------------------
+    # UI 构建
+    # ------------------------------------------------------------------
+    def _card(self, parent, title, manager="pack", **kw):
+        """LabelFrame → 双风格卡片壳（v3.14.0 C，对齐 pt-tools A2 / 剪映 B）。
+
+        玻璃档案用 GlassCard（雾面壳+白描边+顶缘波纹条），像素档案用
+        PixelCard（直角+描边+4px 高光条）；返回 ``.body`` 内容容器 ——
+        卡内控件的 pack/grid 写法与旧 LabelFrame 完全一致，行内零改动。
+
+        ⚠️ manager 必须与 parent 的布局管理器一致（铁律 2：pack/grid 不混用；
+        rename 的 target 页 f 走 grid，是 B3 撞冲突的回滚点）。
+        """
+        cls = GlassCard if current_button_style() == "glass" else PixelCard
+        c = cls(parent, title=title)
+        if manager == "grid":
+            c.grid(**kw)
+        else:
+            c.pack(**kw)
+        return c.body
+
+    def _rebuild_tabs(self):
+        """按钮风格切换后重建五页：卡片壳随 GlassCard/PixelCard 换壳。
+
+        各页 _build_xxx_tab 均为可重入实现（控件值从 self.cfg 重读、
+        尾部 reload 方法幂等）；执行中（self._busy）跳过本次重建。
+        v3.14.0 P1-5：换壳前把「改了还没保存」的输入写回 cfg——builder
+        从 cfg 重读初值，不写回用户输入会被静默重置。
+        """
+        if getattr(self, "_busy", False):
+            return
+        try:
+            for key, var in getattr(self, "field_vars", {}).items():
+                self.cfg["fields"][key] = var.get()
+        except Exception:
+            pass
+        try:
+            self.cfg["last_root"] = self.var_root.get()
+        except Exception:
+            pass
+        try:
+            self.cfg["exts"] = self.var_exts.get()
+        except Exception:
+            pass
+        pairs = ((self.tab_rule, self._build_rule_tab),
+                 (self.tab_target, self._build_target_tab),
+                 (self.tab_run, self._build_run_tab),
+                 (self.tab_undo, self._build_undo_tab),
+                 (self.tab_folder, self._build_folder_tab))
+        for sf, builder in pairs:
+            inner = sf.inner
+            for w in inner.winfo_children():
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+        # 先全部清场再统一重建：跨页控件引用（预览样例等）不存在互相依赖，
+        # 但分页清重建会让「字段值 trace」在重建间隙触发刷新打到已销毁控件。
+        for _sf, builder in pairs:
+            try:
+                builder()
+            except Exception:
+                pass
+        # 重建后的新 Text/Listbox 补原生重着色 + 新控件补 tooltip 增强
+        try:
+            recolor(self)
+        except Exception:
+            pass
+        try:
+            self._auto_enhance()
+        except Exception:
+            pass
+
+    def _build_ui(self):
+        # v3.12.0：顶部横幅（大图标色块 + 标题）
+        hdr = HeroHeader(
+            self, title="统一命名工具",
+            subtitle="v%s · %s" % (CFG.APP_VERSION, CFG.build_date()),
+            icon="edit")
+        hdr.pack(fill="x")
+        self.hero = hdr   # 提升引用：主题切换后重绘头部右侧分段器
+        # v3.13.0 C2.5：头部右侧 Canvas 分段风格切换器
+        #（像素 Pixel / 玻璃 Glass / 圆润 Rounded，移动指示器、记忆选择）
+        try:
+            self.style_seg = Segmented(hdr.right, options=list_button_styles(),
+                                       value=current_button_style(),
+                                       command=self._on_bstyle_change,
+                                       bg=hdr._bg, padx=10, pady=5)
+            self.style_seg.pack(side="right", padx=(10, 0))
+        except Exception:
+            self.style_seg = None
+        Badge(hdr.right, text="Pro", variant="accent",
+              bg=hdr._bg).pack(side="left")
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=PAD_LG, pady=(PAD_SM, PAD_MD))
+        self.nb = nb
+
+        # G2/J12（D2 · 2026-09-27）：五页统一套可滚动容器（padding=0，各页
+        # 自带布局边距）；构建函数里的 f = self.tab_x 已改为取 .inner。
+        self.tab_rule = ScrollableFrame(nb, padding=0)
+        self.tab_target = ScrollableFrame(nb, padding=0)
+        self.tab_run = ScrollableFrame(nb, padding=0)
+        self.tab_undo = ScrollableFrame(nb, padding=0)
+        self.tab_folder = ScrollableFrame(nb, padding=0)   # v1.7.0：合并进来的工程文件夹建树
+        nb.add(self.tab_rule, text="📋 项目信息与模板")
+        nb.add(self.tab_target, text="🎯 目标与归位")
+        nb.add(self.tab_run, text="▶ 预览与执行")
+        nb.add(self.tab_undo, text="↩ 回溯与撤销")
+        nb.add(self.tab_folder, text="📁 工程文件夹")
+
+        self._build_rule_tab()
+        self._build_target_tab()
+        self._build_run_tab()
+        self._build_undo_tab()
+        self._build_folder_tab()
+
+        # 状态栏
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", side="bottom", padx=PAD_LG, pady=(0, PAD_SM))
+        self.var_status = tk.StringVar(value="就绪")
+        self.status_led = StatusLED(bar, state="ok", size=12)
+        self.status_led.pack(side="left", padx=(0, PAD_SM))
+        ttk.Label(bar, textvariable=self.var_status, style="Small.TLabel").pack(side="left")
+        # v3.13.0 B2：主题/按钮风格下拉已收进菜单栏「设置」（_build_menubar），
+        # 状态栏只留 状态灯+状态字+配置路径——选项类控件不再常驻状态栏
+        ttk.Label(bar, text="配置文件: " + CFG.CONFIG_PATH,
+                  style="Small.TLabel").pack(side="right")
+        # v3.13.0 B1/B2：UI 建完补跑原生重着色（apply 在建 UI 前跑过一次，
+        # 后建的 Listbox/Text 不会被覆盖，留着 Windows 默认蓝选中/白底穿帮）
+        recolor(self)
+        self.after(600, self._auto_enhance)
+
+    def _build_menubar(self):
+        """v3.13.0 B2：菜单栏「设置」——主题 / 按钮风格（原状态栏两下拉收编）。
+
+        复用 _on_theme_change/_on_bstyle_change 与同一对 StringVar，
+        菜单 radiobutton 与运行时状态保持同步。
+        """
+        menubar = tk.Menu(self)
+        m_set = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="设置", menu=m_set)
+        self.var_theme = tk.StringVar(
+            value=current_theme_name() or self.cfg.get("theme") or DEFAULT_THEME)
+        m_theme = tk.Menu(m_set, tearoff=0)
+        m_set.add_cascade(label="主题", menu=m_theme)
+        for key, label in list_themes():
+            m_theme.add_radiobutton(label=label, value=key,
+                                    variable=self.var_theme,
+                                    command=self._on_theme_change)
+        self.var_bstyle = tk.StringVar(value=current_button_style())
+        m_bstyle = tk.Menu(m_set, tearoff=0)
+        m_set.add_cascade(label="按钮风格", menu=m_bstyle)
+        for key, label in list_button_styles():
+            m_bstyle.add_radiobutton(label=label, value=key,
+                                     variable=self.var_bstyle,
+                                     command=self._on_bstyle_change)
+        self.config(menu=menubar)
+
+    def _auto_enhance(self):
+        """v3.12.0：遍历全部 Treeview 加行 hover 高亮。"""
+        def walk(w):
+            try:
+                if isinstance(w, ttk.Treeview):
+                    attach_tree_hover(w)
+            except Exception:
+                pass
+            try:
+                for c in w.winfo_children():
+                    walk(c)
+            except Exception:
+                pass
+        walk(self)
+        auto_tooltip(self)
+
+    # ============ 页1：项目信息与模板 ============
+    def _build_rule_tab(self):
+        f = self.tab_rule.inner
+        pad = {"padx": 6, "pady": 3}
+
+        # ---- 字段值 ----
+        # v3.13.0 C3（B3 人工复核补做）：长括号标题 → 短标题 + 灰 caption（pack 同管理器）
+        fld = self._card(f, "字段值", fill="x", padx=PAD_LG, pady=(PAD_LG, 0))
+        # v3.14.0 P0-B3：提示行进卡内（原来 pack 在页根上，悬在卡外缝隙里）。
+        # ⚠️ fld 内部全 grid（铁律 2）——首版改 pack 直接把页搞崩，回读实拍才抓到。
+        ttk.Label(fld, style="Hint.TLabel",
+                  text="改这里即可换项目，无需碰模板").grid(
+            row=5, column=0, columnspan=3, sticky="w",
+            padx=PAD_LG + 10, pady=(0, PAD_SM))
+
+        hint_map = {
+            "片名": "剧名/项目名缩写（开源版示例；工具不预设具体项目）",
+            "日期": "如 0923 或 20260923",
+            "版本": "如 V01、V02",
+            "用户": "你的个人代号，如 AB（v1.1.0 里叫「档位」）",
+        }
+        self.field_vars = {}
+        row = 0
+        for key in ("片名", "日期", "版本", "用户"):
+            ttk.Label(fld, text=key + ":").grid(row=row, column=0, sticky="w", **pad)
+            v = tk.StringVar(value=self.cfg["fields"].get(key, ""))
+            self.field_vars[key] = v
+            ttk.Entry(fld, textvariable=v, width=26).grid(row=row, column=1,
+                                                          sticky="w", **pad)
+            ttk.Label(fld, text=hint_map.get(key, ""), style="Hint.TLabel").grid(
+                row=row, column=2, sticky="w", padx=6)
+            row += 1
+
+        ex = ttk.Frame(fld)
+        ex.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(6, 4))
+        ttk.Label(ex, text="实时样例:").pack(side="left")
+        self.var_sample = tk.StringVar(value="")
+        ttk.Label(ex, textvariable=self.var_sample, foreground=COLOR_OK,
+                  font=("Consolas", 10, "bold")).pack(side="left", padx=8)
+
+        # ---- 模板库 ----
+        # v3.13.0 C3：长括号标题 → 短标题 + 灰 caption（pack 同管理器）
+        tb = self._card(f, "模板库", fill="both", expand=True, padx=10, pady=(2, 0))
+        ttk.Label(f, style="Hint.TLabel",
+                  text="第 1 条为兜底模板：目标表里没单独指定模板的目标用它",
+                  ).pack(anchor="w", padx=14, pady=(0, 6))
+
+        ttk.Label(
+            tb, justify="left", style="Hint.TLabel",
+            text=("模板与目标已拆开：MIX 可以走「全格式」，BUS/STEM 走「短格式」，"
+                  "各改各的。占位符：{片名} {集数} {日期} {版本} {用户} {轨道信息}。\n"
+                  "扩展名自动沿用源文件，模板里不要写 .wav。双击一行即可编辑。")
+        ).pack(anchor="w", padx=8, pady=(6, 4))
+
+        cols = ("no", "name", "tpl", "sample")
+        self.tree_tpl = ttk.Treeview(tb, columns=cols, show="headings", height=8)
+        self.tree_tpl.heading("no", text="#")
+        self.tree_tpl.heading("name", text="模板名")
+        self.tree_tpl.heading("tpl", text="模板内容")
+        self.tree_tpl.heading("sample", text="样例（1 集 / DX BUS）")
+        self.tree_tpl.column("no", width=40, anchor="center", stretch=False)
+        self.tree_tpl.column("name", width=140, stretch=False)
+        self.tree_tpl.column("tpl", width=420)
+        self.tree_tpl.column("sample", width=320)
+        ts = ttk.Scrollbar(tb, orient="vertical", command=self.tree_tpl.yview)
+        self.tree_tpl.configure(yscrollcommand=ts.set)
+        ts.pack(side="right", fill="y", pady=6)
+        self.tree_tpl.pack(fill="both", expand=True, side="left", padx=(8, 0), pady=6)
+        self.tree_tpl.bind("<Double-Button-1>", self._on_tpl_dblclick)
+        fit_tree_columns(self.tree_tpl, min_widths={"no": 36, "name": 90,
+                                                    "tpl": 160, "sample": 120})
+
+        b1 = ttk.Frame(f)
+        b1.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(b1, text="保存为默认", command=self._save_cfg).pack(side="right", padx=4)
+        ttk.Button(b1, text="恢复内置模板", command=self._reset_templates).pack(side="right", padx=4)
+        ttk.Button(b1, text="✗ 删除模板", command=self._del_template,
+                   style="Danger.TButton").pack(side="right", padx=4)
+        ttk.Button(b1, text="编辑模板", command=self._edit_template).pack(side="right", padx=4)
+        ttk.Button(b1, text="＋ 新增模板", command=self._add_template).pack(side="right", padx=4)
+
+        self._reload_templates()
+
+        for v in self.field_vars.values():
+            v.trace_add("write", lambda *a: self._on_field_change())
+
+    def _on_field_change(self):
+        """字段变了：样例要重算，模板库的样例列也要重算。"""
+        self._reload_templates()
+        self._refresh_preview()
+
+    def _reload_templates(self):
+        self.tree_tpl.delete(*self.tree_tpl.get_children())
+        fields = self._fields()
+        for i, t in enumerate(self.templates):
+            tpl = str(t.get("tpl", ""))
+            try:
+                sample = CORE.render(tpl, "1", "DX BUS", fields) + ".wav"
+            except Exception as e:
+                sample = "[模板错误] %s" % e
+            self.tree_tpl.insert("", "end", iid=str(i), values=(
+                i + 1,
+                str(t.get("name", "")),
+                tpl,
+                sample))
+
+    def _tpl_sel_index(self):
+        sel = self.tree_tpl.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _add_template(self):
+        name = simpledialog.askstring("新增模板", "模板名（如 全格式 / 短格式）:",
+                                      parent=self)
+        if not name:
+            return
+        tpl = simpledialog.askstring(
+            "新增模板", "模板内容:\n可用 {片名} {集数} {日期} {版本} {用户} {轨道信息}",
+            initialvalue=CORE.DEFAULT_TEMPLATE, parent=self)
+        if not tpl:
+            return
+        self.templates.append({"name": name.strip(), "tpl": tpl.strip()})
+        self._reload_templates()
+        self._log("已新增模板: %s" % name.strip())
+
+    def _on_tpl_dblclick(self, _event):
+        self._edit_template()
+
+    def _edit_template(self):
+        i = self._tpl_sel_index()
+        if i is None:
+            messagebox.showinfo("未选中", "请先选中一行模板。")
+            return
+        t = self.templates[i]
+        name = simpledialog.askstring("编辑模板", "模板名:", initialvalue=t.get("name", ""),
+                                      parent=self)
+        if name is None:
+            return
+        tpl = simpledialog.askstring("编辑模板", "模板内容:",
+                                     initialvalue=t.get("tpl", ""), parent=self)
+        if tpl is None:
+            return
+        t["name"] = name.strip()
+        t["tpl"] = tpl.strip()
+        self._reload_templates()
+        self._refresh_preview()
+
+    def _del_template(self):
+        i = self._tpl_sel_index()
+        if i is None:
+            messagebox.showinfo("未选中", "请先选中一行模板。")
+            return
+        if len(self.templates) <= 1:
+            messagebox.showwarning("不能删除", "至少要保留一套模板（第 1 条兼作兜底）。")
+            return
+        t = self.templates[i]
+        if not messagebox.askokcancel("删除模板", "删除模板「%s」？" % t.get("name", "")):
+            return
+        self.templates.pop(i)
+        self._reload_templates()
+        self._refresh_preview()
+
+    def _reset_templates(self):
+        if not messagebox.askokcancel("恢复内置模板", "将丢弃当前模板库，恢复内置默认？"):
+            return
+        self.templates = [dict(t) for t in CORE.DEFAULT_TEMPLATES]
+        self._reload_templates()
+        self._refresh_preview()
+        self._log("已恢复内置模板库")
+
+    def _global_template(self):
+        """兜底模板 = 模板库第 1 条的内容。"""
+        if self.templates:
+            tpl = str(self.templates[0].get("tpl", "")).strip()
+            if tpl:
+                return tpl
+        return CORE.DEFAULT_TEMPLATE
+
+    # ============ 页2：目标与归位 ============
+    def _build_target_tab(self):
+        """可编辑的目标表 + 识别规则表。
+
+        为什么这一页：交付类型并非每集都一样 —— 第 1 集可能只交 BUS，
+        第 4 集才补 STEM。用「启用 + 限定集数」表达这种差异，比改模板或事后
+        挪文件都安全（未启用的目标在计划阶段就标「按目标排除」，不动盘）。
+        """
+        f = self.tab_target.inner
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(0, weight=3)
+        f.rowconfigure(1, weight=2)
+
+        ttk.Label(
+            f, justify="left", style="Hint.TLabel",
+            text=("目标决定「东西放哪、用哪套模板」。双击：『启用』列切换勾选，"
+                  "『归位目录』『限定集数』列输入，『用哪套模板』列从模板库选。\n"
+                  "限定集数留空 = 全部集；填 1 或 1,3-5 可只对指定集生效。")
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+
+        wrap = self._card(f, "目标与归位（双击编辑）", manager="grid",
+                          row=0, column=0, sticky="nsew", padx=10, pady=(22, 6))
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+
+        cols = ("enabled", "name", "dir", "tpl", "eps", "note")
+        self.tree_tgt = ttk.Treeview(wrap, columns=cols, show="headings", height=7)
+        self.tree_tgt.heading("enabled", text="启用")
+        self.tree_tgt.heading("name", text="目标")
+        self.tree_tgt.heading("dir", text="归位目录")
+        self.tree_tgt.heading("tpl", text="用哪套模板")
+        self.tree_tgt.heading("eps", text="限定集数")
+        self.tree_tgt.heading("note", text="说明")
+        self.tree_tgt.column("enabled", width=70, anchor="center", stretch=False)
+        self.tree_tgt.column("name", width=90, anchor="center", stretch=False)
+        self.tree_tgt.column("dir", width=110, anchor="center", stretch=False)
+        self.tree_tgt.column("tpl", width=180, stretch=False)
+        self.tree_tgt.column("eps", width=120, anchor="center", stretch=False)
+        self.tree_tgt.column("note", width=340)
+        tsb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree_tgt.yview)
+        self.tree_tgt.configure(yscrollcommand=tsb.set)
+        tsb.grid(row=0, column=1, sticky="ns", pady=6)
+        self.tree_tgt.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=6)
+        self.tree_tgt.tag_configure("on", foreground=COLOR_OK)
+        self.tree_tgt.tag_configure("off", foreground="#9e9e9e")
+        self.tree_tgt.tag_configure("limited", foreground=COLOR_WARN)
+        self.tree_tgt.bind("<Double-Button-1>", self._on_target_dblclick)
+        fit_tree_columns(self.tree_tgt, min_widths={"enabled": 48, "name": 60,
+                                                    "dir": 60, "tpl": 90,
+                                                    "eps": 60, "note": 100})
+
+        self._reload_targets()
+
+        tb = ttk.Frame(f)
+        tb.grid(row=0, column=0, sticky="sew", padx=16, pady=(0, 16))
+        ttk.Button(tb, text="保存为默认", command=self._save_cfg).pack(side="right", padx=4)
+        ttk.Button(tb, text="恢复内置目标", command=self._reset_targets).pack(side="right", padx=4)
+        ttk.Button(tb, text="✗ 删除目标", command=self._del_target,
+                   style="Danger.TButton").pack(side="right", padx=4)
+        ttk.Button(tb, text="＋ 新增目标", command=self._add_target).pack(side="right", padx=4)
+        ttk.Button(tb, text="全不选", command=lambda: self._set_all_targets(False)).pack(side="right", padx=4)
+        ttk.Button(tb, text="全选", command=lambda: self._set_all_targets(True)).pack(side="right", padx=4)
+
+        # ---- 识别规则（高级）----
+        # v3.13.0 C3：⚠️ 此处 parent f 走 **grid**——caption 必须 grid（row=2），
+        # 绝不可 pack（B3 撞 pack/grid 冲突的回滚点之一）。
+        rl = self._card(f, "识别规则（高级）", manager="grid",
+                        row=1, column=0, sticky="nsew", padx=10, pady=(0, 2))
+        ttk.Label(f, style="Hint.TLabel",
+                  text="把历史命名映射到目标；自上而下首个命中生效，一般不用改",
+                  ).grid(row=2, column=0, sticky="w", padx=14, pady=(0, 10))
+        rl.rowconfigure(0, weight=1)
+        rl.columnconfigure(0, weight=1)
+
+        rcols = ("target", "pattern", "out")
+        self.tree_rules = ttk.Treeview(rl, columns=rcols, show="headings", height=6)
+        self.tree_rules.heading("target", text="目标")
+        self.tree_rules.heading("pattern", text="匹配模式（支持 {片名} 等宽松占位符）")
+        self.tree_rules.heading("out", text="轨道信息")
+        self.tree_rules.column("target", width=90, anchor="center", stretch=False)
+        self.tree_rules.column("pattern", width=620)
+        self.tree_rules.column("out", width=170, stretch=False)
+        rsb = ttk.Scrollbar(rl, orient="vertical", command=self.tree_rules.yview)
+        self.tree_rules.configure(yscrollcommand=rsb.set)
+        rsb.grid(row=0, column=1, sticky="ns", pady=6)
+        self.tree_rules.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=6)
+        fit_tree_columns(self.tree_rules, min_widths={"target": 60,
+                                                      "pattern": 200,
+                                                      "out": 80})
+
+        self.rules = [list(r) for r in
+                      (self.cfg["rules"] if self.cfg.get("rules") else CORE.DEFAULT_RULES)]
+        self._reload_rules()
+
+        rb = ttk.Frame(f)
+        # v3.14.0 P0-B1：原 grid(row=1) 与识别规则卡同格重叠——按钮浮在
+        # 表格底部把 STEM 行压断（实拍）。挪 row=3（caption 之后）。
+        rb.grid(row=3, column=0, sticky="sew", padx=16, pady=(0, 20))
+        # R3（v1.5.0）：规则集导出/导入 —— 两机同步不再依赖整仓 git
+        ttk.Button(rb, text="导入规则集…", command=self._import_rules).pack(side="right", padx=4)
+        ttk.Button(rb, text="导出规则集…", command=self._export_rules).pack(side="right", padx=4)
+        ttk.Button(rb, text="恢复内置规则", command=self._reset_rules).pack(side="right", padx=4)
+
+    def _reload_targets(self):
+        self.tree_tgt.delete(*self.tree_tgt.get_children())
+        for idx, t in enumerate(self.targets):
+            self.tree_tgt.insert("", "end", iid=str(idx),
+                                 values=self._target_row_values(t),
+                                 tags=(self._target_row_tag(t),))
+
+    def _target_row_values(self, t):
+        return ("[√] 启用" if t.get("enabled", True) else "[ ] 停用",
+                t.get("name", ""),
+                t.get("dir", "") or "（集根）",
+                t.get("tpl_name", "") or TPL_GLOBAL,
+                t.get("eps", "") or "（全部集）",
+                t.get("note", ""))
+
+    @staticmethod
+    def _target_row_tag(t):
+        if not t.get("enabled", True):
+            return "off"
+        if CORE.parse_eps(t.get("eps")):
+            return "limited"
+        return "on"
+
+    def _target_sel_index(self):
+        sel = self.tree_tgt.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _on_target_dblclick(self, event):
+        row = self.tree_tgt.identify_row(event.y)
+        col = self.tree_tgt.identify_column(event.x)
+        if not row:
+            return
+        try:
+            t = self.targets[int(row)]
+        except (ValueError, IndexError):
+            return
+
+        if col == "#1":                      # 启用
+            t["enabled"] = not t.get("enabled", True)
+        elif col == "#3":                    # 归位目录
+            new = simpledialog.askstring(
+                "归位目录",
+                "放到集目录下的哪一层？（留空 = 直接放集根）\n例：BUS、STEM",
+                initialvalue=t.get("dir", ""), parent=self)
+            if new is None:
+                return
+            t["dir"] = new.strip()
+        elif col == "#4":                    # 用哪套模板
+            picked = self._pick_template(t)
+            if picked is None:
+                return
+        elif col == "#5":                    # 限定集数
+            new = simpledialog.askstring(
+                "限定集数",
+                "只对哪些集生效？（留空 = 全部集）\n例：1 或 1,3-5",
+                initialvalue=t.get("eps", ""), parent=self)
+            if new is None:
+                return
+            t["eps"] = new.strip()
+        else:
+            return
+        self._reload_targets()
+        self._refresh_preview()
+
+    def _pick_template(self, t):
+        """从模板库 + 两个特殊值里挑一套，写回 t 的 templates/tpl_name。"""
+        opts = [(TPL_GLOBAL, TPL_GLOBAL + "（第 1 条）")]
+        for tp in self.templates:
+            opts.append((str(tp.get("name", "")), "模板：%s" % tp.get("name", "")))
+        opts.append((CORE.KEEP_NAME, "保持原名（只归类、不改名）"))
+
+        cur = t.get("tpl_name", "") or TPL_GLOBAL
+        picked = self._choose_dialog("用哪套模板",
+                                     "目标「%s」改名时用哪一套？" % t.get("name", ""),
+                                     opts, cur)
+        if picked is None:
+            return None
+        if picked == TPL_GLOBAL:
+            t["templates"] = []
+            t["tpl_name"] = ""
+        elif picked == CORE.KEEP_NAME:
+            t["templates"] = [CORE.KEEP_NAME]
+            t["tpl_name"] = CORE.KEEP_NAME
+        else:
+            hit = [tp for tp in self.templates if str(tp.get("name", "")) == picked]
+            if not hit:
+                return None
+            t["templates"] = [str(hit[0].get("tpl", ""))]
+            t["tpl_name"] = picked
+        return picked
+
+    def _on_theme_change(self, _event=None):
+        """S13：主题下拉切换 → 运行时换色 + 持久化。
+
+        v3.14.0 P0-1：切主题走轻量 refresh 链（卡片壳/头部横幅换色，
+        不销毁控件、不丢输入——换壳 rebuild 是风格切换专用）。
+        """
+        name = self.var_theme.get()
+        actual = set_theme(self, name)
+        self.var_theme.set(actual)
+        self.cfg["theme"] = actual
+        CFG.save_config(self.cfg)
+        try:
+            if hasattr(self, "particle") and self.particle.winfo_exists():
+                self.particle.set_theme(actual)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "style_seg", None) is not None:
+                self.style_seg.refresh()   # C2.5：分段器配色随主题重绘
+        except Exception:
+            pass
+        # v3.14.0 P0-1：卡片壳 + 头部横幅随主题换色
+        try:
+            refresh_cards(self)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "hero", None) is not None:
+                self.hero.refresh()
+        except Exception:
+            pass
+        self.var_status.set("主题已切换: %s" % actual)
+
+    def _on_bstyle_change(self, _event=None):
+        """v3.12.1：按钮风格切换（rounded 圆润 / pixel 像素 / glass 玻璃）→
+        运行时生效 + 持久化 + 卡片壳重建。
+
+        v3.14.0 C：旧白名单 ("rounded","pixel") 会把 C2.5 新增的 glass
+        静默拒掉 —— 合法值校验交给 set_button_style（theme 层单一真源），
+        本处不再自设白名单；切换后重建五页（卡片壳随档案换壳）。
+
+        v3.14.0 P1-6：执行中（_busy）不静默——状态栏明说「任务结束后生效」，
+        不再出现「报了已切换、界面却没变」的假成功。
+        """
+        name = self.var_bstyle.get()
+        actual = set_button_style(self, name)
+        self.var_bstyle.set(actual)
+        self.cfg["button_style"] = actual
+        CFG.save_config(self.cfg)
+        if getattr(self, "_busy", False):
+            # v3.14.0 P1-6 衍生：set_button_style 内部 apply() 已全树重着色，
+            # 跳过 rebuild 时用 refresh 链兜底，防卡片壳停在乱刷残色
+            try:
+                refresh_cards(self)
+            except Exception:
+                pass
+            self.var_status.set(
+                "按钮风格已存为 %s；任务进行中，界面将在任务结束后（或重启后）换壳" % actual)
+            return
+        self._rebuild_tabs()
+        self.var_status.set("按钮风格已切换: %s" % actual)
+
+    def _choose_dialog(self, title, prompt, options, current=None):
+        """通用单选对话框。options = [(value, label)]，取消返回 None。"""
+        dlg = tk.Toplevel(self)
+        dlg.title(title)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.geometry("440x380")
+        ttk.Label(dlg, text=prompt, wraplength=400, justify="left").pack(
+            anchor="w", padx=12, pady=(12, 8))
+        lb = tk.Listbox(dlg, activestyle="dotbox")
+        lb.pack(fill="both", expand=True, padx=12)
+        for _v, label in options:
+            lb.insert("end", label)
+        for i, (v, _l) in enumerate(options):
+            if current is not None and v == current:
+                lb.selection_set(i)
+                lb.see(i)
+                break
+
+        result = {"v": None}
+
+        def ok():
+            sel = lb.curselection()
+            if sel:
+                result["v"] = options[sel[0]][0]
+            dlg.destroy()
+
+        bf = ttk.Frame(dlg)
+        bf.pack(fill="x", padx=12, pady=10)
+        ttk.Button(bf, text="确定", command=ok).pack(side="right", padx=4)
+        ttk.Button(bf, text="取消", command=dlg.destroy).pack(side="right", padx=4)
+        lb.bind("<Double-Button-1>", lambda _e: ok())
+        self.wait_window(dlg)
+        return result["v"]
+
+    def _add_target(self):
+        name = simpledialog.askstring("新增目标", "目标名（如 BUS / STEM / MIX）:", parent=self)
+        if not name:
+            return
+        name = name.strip().upper()
+        if any(t.get("name") == name for t in self.targets):
+            messagebox.showwarning("已存在", "目标「%s」已经在表里了。" % name)
+            return
+        self.targets.append({"name": name, "dir": name, "enabled": True, "eps": "",
+                             "note": "自定义目标", "templates": [], "tpl_name": ""})
+        self._reload_targets()
+        self._refresh_preview()
+
+    def _del_target(self):
+        i = self._target_sel_index()
+        if i is None:
+            messagebox.showinfo("未选中", "请先选中一行目标。")
+            return
+        t = self.targets[i]
+        if not messagebox.askokcancel(
+                "删除目标", "删除目标「%s」？\n（已归属该目标的文件将因『目标表未列出』被判为排除）"
+                % t.get("name", "")):
+            return
+        self.targets.pop(i)
+        self._reload_targets()
+        self._refresh_preview()
+
+    def _set_all_targets(self, flag):
+        for t in self.targets:
+            t["enabled"] = flag
+        self._reload_targets()
+        self._refresh_preview()
+
+    def _reset_targets(self):
+        if not messagebox.askokcancel("恢复内置目标", "将丢弃当前目标表，恢复内置默认？"):
+            return
+        self.targets = CORE.normalize_targets(CORE.DEFAULT_TARGETS)
+        self._reload_targets()
+        self._refresh_preview()
+        self._log("已恢复内置目标表")
+
+    def _reload_rules(self):
+        self.tree_rules.delete(*self.tree_rules.get_children())
+        for r in self.rules:
+            self.tree_rules.insert("", "end", values=tuple(r[:3]))
+
+    def _reset_rules(self):
+        if not messagebox.askokcancel("恢复内置规则", "将丢弃当前规则，恢复内置默认规则？"):
+            return
+        self.rules = [list(r) for r in CORE.DEFAULT_RULES]
+        self._reload_rules()
+        self._refresh_preview()
+        self._log("已恢复内置识别规则")
+
+    # ============ 页3：预览与执行 ============
+    def _build_run_tab(self):
+        f = self.tab_run.inner
+
+        top = self._card(f, "目标范围", fill="x", padx=PAD_LG, pady=(PAD_LG, PAD_SM))
+        top.columnconfigure(1, weight=1)
+
+        ttk.Label(top, text="目标目录:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.var_root = tk.StringVar(value=self.cfg["last_root"])
+        entry_root = ttk.Entry(top, textvariable=self.var_root)
+        entry_root.grid(row=0, column=1, sticky="ew", padx=6)
+        # G1（v2.6.6 / B批）：目标目录支持拖入，拖入即刷新预览
+        enable_path_drop(entry_root, self._drop_root)
+        ttk.Button(top, text="浏览…", command=self._pick_root).grid(row=0, column=2, padx=6)
+
+        opt = ttk.Frame(top)
+        opt.grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=(2, 6))
+        self.var_rec = tk.BooleanVar(value=bool(self.cfg["recursive"]))
+        ttk.Label(opt, text="含子目录").pack(side="left")
+        def _on_rec(v):
+            self.var_rec.set(v)
+            self._refresh_preview()
+        ToggleSwitch(opt, value=self.var_rec.get(),
+                     command=_on_rec).pack(side="left", padx=(5, 14))
+        ttk.Label(opt, text="扩展名:").pack(side="left")
+        self.var_exts = tk.StringVar(value=self.cfg["exts"])
+        ttk.Entry(opt, textvariable=self.var_exts, width=30).pack(side="left", padx=6)
+
+        # v1.3.0 开关（2026-09-23 用户新增能力，默认全开）
+        opt2 = ttk.Frame(top)
+        opt2.grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
+        self.var_mtime_date = tk.BooleanVar(value=bool(self.cfg.get("date_from_mtime", True)))
+        ttk.Checkbutton(
+            opt2, text="日期用文件修改时间兜底（源名/目录都没有日期时）",
+            variable=self.var_mtime_date,
+            command=self._refresh_preview).pack(side="left", padx=(0, 12))
+        self.var_rename_dirs = tk.BooleanVar(value=bool(self.cfg.get("rename_ep_dirs", True)))
+        ttk.Checkbutton(
+            opt2, text="集目录按「片名 N集 日期 版本 用户」改名",
+            variable=self.var_rename_dirs,
+            command=self._refresh_preview).pack(side="left")
+
+        ttk.Label(top, foreground="#666", justify="left",
+                  text=("落点由页2 的「目标表」决定：MIX → 集根；BUS → 集目录\\BUS；"
+                        "STEM/AIFX → 集目录\\STEM。集目录名与 Master 文件名同构；"
+                        "改名后旧目录空壳只提醒、不自动删。")
+                  ).grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
+
+        act = ttk.Frame(f)
+        act.pack(fill="x", padx=PAD_LG, pady=(0, PAD_SM))
+        self.var_plan_state = tk.StringVar(value="尚未生成计划")
+        self.lbl_plan_state = ttk.Label(act, textvariable=self.var_plan_state,
+                                        style="Bad.TLabel")
+        self.lbl_plan_state.pack(side="left")
+
+        self.btn_apply = ttk.Button(act, text="▶ 执行重命名", command=self._on_apply,
+                                    style="Accent.TButton", state="disabled")
+        self.btn_apply.pack(side="right", padx=4)
+        self.btn_plan = ttk.Button(act, text="↻ 生成计划", command=self._refresh_preview)
+        self.btn_plan.pack(side="right", padx=4)
+        self.btn_manual = ttk.Button(act, text="手动分类…", command=self._on_manual)
+        self.btn_manual.pack(side="right", padx=4)
+
+        # v3.13.0 C3：长括号标题 → 短标题 + 灰 caption（pack 同管理器）
+        pv = self._card(f, "变更计划", fill="both", expand=True, padx=10, pady=(2, 0))
+        ttk.Label(f, style="Hint.TLabel",
+                  text="先预览；识别失败的可选中后点「手动分类」指定集数与目标",
+                  ).pack(anchor="w", padx=14, pady=(0, 6))
+
+        cols = ("st", "old", "new", "target", "note")
+        self.tree_plan = ttk.Treeview(pv, columns=cols, show="headings")
+        self.tree_plan.heading("st", text="状态")
+        self.tree_plan.heading("old", text="原文件名")
+        self.tree_plan.heading("new", text="新文件名")
+        self.tree_plan.heading("target", text="目标")
+        self.tree_plan.heading("note", text="说明")
+        self.tree_plan.column("st", width=90, anchor="center", stretch=False)
+        self.tree_plan.column("old", width=330)
+        self.tree_plan.column("new", width=360)
+        self.tree_plan.column("target", width=90, anchor="center", stretch=False)
+        self.tree_plan.column("note", width=230)
+        for st, col in STATUS_COLOR.items():
+            self.tree_plan.tag_configure(st or "ok", foreground=col)
+
+        vs = ttk.Scrollbar(pv, orient="vertical", command=self.tree_plan.yview)
+        self.tree_plan.configure(yscrollcommand=vs.set)
+        vs.pack(side="right", fill="y", pady=6)
+        self.tree_plan.pack(fill="both", expand=True, side="left", padx=(6, 0), pady=6)
+        self.tree_plan.bind("<Double-Button-1>", self._on_plan_dblclick)
+        # S11：变更计划表列宽合计原为 1100px（横条元凶），现按权重自适应
+        fit_tree_columns(self.tree_plan, min_widths={"st": 60, "old": 140,
+                                                     "new": 140, "target": 60,
+                                                     "note": 80})
+
+        lg = self._card(f, "日志", fill="both", padx=10, pady=(0, 10))
+        self.txt_log = tk.Text(lg, height=6, wrap="none", state="disabled",
+                               font=("Consolas", 9))
+        ls = ttk.Scrollbar(lg, orient="vertical", command=self.txt_log.yview)
+        self.txt_log.configure(yscrollcommand=ls.set)
+        ls.pack(side="right", fill="y", padx=(0, 4), pady=4)
+        self.txt_log.pack(fill="both", expand=True, side="left", padx=6, pady=4)
+
+    # ============ 页4：回溯与撤销 ============
+    # ============ 页5：工程文件夹（v1.7.0 · D 档合并 F7+R2 / 甲案）============
+    def _build_folder_tab(self):
+        """原 pt-project-folder-builder 整体迁入 rename-unify 第 5 页签。
+
+        合并要点（Q4 判定「三套命名字段链同构」）：
+          · 项目名默认取**页1 的「片名」**，两处不再各填一遍（一条字段捕获链）；
+          · F5：「项目根」选项**已删除**，集数固定建在 Project 子目录下；
+          · F6：保留「从上次项目提取」（目录推断，与页1 字段链同源）；
+          · G1：模板/输出路径框支持文件夹拖入（tkinterdnd2 缺席时安全回退）。
+        """
+        f = self.tab_folder.inner
+        ft = self.cfg.get("foldertree") or {}
+        pad = {"padx": 6, "pady": 3}
+        self.ft = {}
+
+        def sv(key, default=""):
+            var = tk.StringVar(value=str(ft.get(key, default)))
+            self.ft[key] = var
+            return var
+
+        # ---- ① 路径 ----
+        path_f = self._card(f, "路径", fill="x", padx=PAD_LG, pady=(PAD_LG, PAD_SM))
+        path_f.columnconfigure(1, weight=1)
+        ttk.Label(path_f, text="模板路径").grid(row=0, column=0, sticky="w", **pad)
+        e_tpl = ttk.Entry(path_f, textvariable=sv("template_root"))
+        e_tpl.grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(path_f, text="浏览", width=8,
+                   command=self._ft_pick_template).grid(row=0, column=2)
+        ttk.Label(path_f, text="输出路径").grid(row=1, column=0, sticky="w", **pad)
+        e_out = ttk.Entry(path_f, textvariable=sv("output_root"))
+        e_out.grid(row=1, column=1, sticky="ew", padx=6)
+        ttk.Button(path_f, text="浏览", width=8,
+                   command=self._ft_pick_output).grid(row=1, column=2)
+        # G1（拖拽）：与页3 目标目录框同一套实现，缺席时静默回退
+        enable_path_drop(e_tpl, lambda ps: self._ft_drop("template_root", ps))
+        enable_path_drop(e_out, lambda ps: self._ft_drop("output_root", ps))
+
+        # ---- ② 本批内容 ----
+        batch_f = self._card(f, "本批内容", fill="x", padx=PAD_LG, pady=(0, PAD_SM))
+        batch_f.columnconfigure(1, weight=1)
+        ttk.Label(batch_f, text="项目名称").grid(row=0, column=0, sticky="w", **pad)
+        # 默认取页1「片名」（字段链收敛）；页1 没填才用 foldertree 自带值
+        _nm = (self.cfg.get("fields", {}).get("片名", "") or ft.get("name", "测试"))
+        e_name = ttk.Entry(batch_f, textvariable=sv("name", _nm))
+        e_name.grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(batch_f, text="从上次项目提取", width=14,
+                   command=self._ft_infer).grid(row=0, column=2, padx=(6, 0))
+        ttk.Label(batch_f, text="集数").grid(row=1, column=0, sticky="nw", **pad)
+        ttk.Entry(batch_f, textvariable=sv("eps", "1-10")).grid(
+            row=1, column=1, columnspan=2, sticky="ew", padx=6)
+        ttk.Label(batch_f, text="支持 逗号分隔 + 连字符区间，如 1-10, 23, 38",
+                  foreground="#888").grid(row=2, column=1, columnspan=2, sticky="w", padx=6)
+
+        # ---- ③ 命名信息 ----
+        info_f = self._card(f, "命名信息", fill="x", padx=PAD_LG, pady=(0, PAD_SM))
+        for i, (key, label) in enumerate(
+                (("seq", "序号"), ("level", "等级"), ("date", "日期"), ("user", "用户"))):
+            ttk.Label(info_f, text=label).grid(row=0, column=i * 2, sticky="w", **pad)
+            default = datetime.datetime.now().strftime("%Y%m%d") if key == "date" else ""
+            ttk.Entry(info_f, width=12,
+                      textvariable=sv(key, default)).grid(row=0, column=i * 2 + 1, padx=4)
+        ttk.Label(info_f, text="集数命名").grid(row=1, column=0, sticky="w", **pad)
+        self._ft_ep_label_by_key = {k: lbl for k, lbl in FT.EP_NAMING_MODES}
+        self._ft_ep_key_by_label = {lbl: k for k, lbl in FT.EP_NAMING_MODES}
+        cb = ttk.Combobox(info_f, width=22, state="readonly",
+                          values=[lbl for _k, lbl in FT.EP_NAMING_MODES])
+        cb.set(self._ft_ep_label_by_key.get(str(ft.get("ep_naming", "name_num")),
+                                            self._ft_ep_label_by_key["name_num"]))
+        cb.grid(row=1, column=1, columnspan=3, sticky="w", padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._ft_refresh())
+        self.ft_ep_naming = cb
+
+        # ---- ④ 选项 ----
+        opt_f = self._card(f, "选项", fill="x", padx=PAD_LG, pady=(0, PAD_SM))
+        ttk.Label(opt_f, text="模板 ptx").grid(row=0, column=0, sticky="w", **pad)
+        self.ft_ptx = tk.StringVar(value=FT.norm_ptx_mode(ft.get("ptx_mode", "原样复制")))
+        ptx_row = ttk.Frame(opt_f)
+        ptx_row.grid(row=0, column=1, sticky="w", padx=4)
+        for key, label in FT.PTX_MODES:
+            ttk.Radiobutton(ptx_row, text=label, variable=self.ft_ptx, value=key,
+                            command=self._ft_refresh).pack(side="left", padx=6)
+        self.ft_skip = tk.BooleanVar(value=bool(ft.get("skip_existing", True)))
+        skip_row = ttk.Frame(opt_f)
+        skip_row.grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Label(skip_row, text="已存在项跳过").pack(side="left")
+        ToggleSwitch(skip_row, value=self.ft_skip.get(),
+                     command=lambda v: self.ft_skip.set(v)
+                     ).pack(side="left", padx=5)
+        ttk.Label(opt_f, text="集数位置：Project 子目录（F5 已删「项目根」选项）",
+                  foreground="#888").grid(row=2, column=1, sticky="w", padx=4, pady=(2, 0))
+
+        # ---- ⑤ 预览 ----
+        prev_f = self._card(f, "预览", fill="both", expand=True, padx=PAD_LG, pady=(0, PAD_SM))
+        self.ft_example = tk.StringVar(value="示例: ")
+        ttk.Label(prev_f, textvariable=self.ft_example).pack(anchor="w", padx=6, pady=(4, 2))
+        # v3.14.0 P0-B2：height 10→6——页5 内容总高超窗，页脚按钮被挤出
+        # 可视区（实拍 tab4 底部按钮不可见）；预览可滚动，6 行足够。
+        self.ft_prev = tk.Text(prev_f, height=6, wrap="none")
+        self.ft_prev.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.ft_prev.configure(state="disabled")
+
+        # ---- ⑥ 按钮 ----
+        btn = ttk.Frame(f)
+        btn.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Button(btn, text="刷新预览", command=self._ft_refresh).pack(side="left")
+        ttk.Button(btn, text="建立工程文件夹",
+                   command=self._ft_build).pack(side="left", padx=8)
+        ttk.Label(btn, text="日志写在「预览与执行」页",
+                  foreground="#888").pack(side="right")
+
+        self._ft_refresh()
+
+    # ---- 页5 辅助 ----
+    def _ft_collect(self):
+        """页5 字段 -> 配置 dict（保存时调用）。"""
+        eps_mode = self._ft_ep_key()
+        return {
+            "template_root": self.ft["template_root"].get().strip(),
+            "output_root": self.ft["output_root"].get().strip(),
+            "name": self.ft["name"].get().strip(),
+            "level": self.ft["level"].get().strip(),
+            "user": self.ft["user"].get().strip(),
+            "eps": self.ft["eps"].get().strip(),
+            "ep_naming": eps_mode,
+            "ptx_mode": self.ft_ptx.get(),
+            "skip_existing": bool(self.ft_skip.get()),
+        }
+
+    def _ft_ep_key(self):
+        """页5 集数命名下拉（显示中文标签）→ 内部键 num/name_num/..."""
+        try:
+            lbl = self.ft_ep_naming.get()
+        except Exception:
+            return "name_num"
+        return getattr(self, "_ft_ep_key_by_label", {}).get(lbl, "name_num")
+
+    def _ft_set_prev(self, text):
+        self.ft_prev.configure(state="normal")
+        self.ft_prev.delete("1.0", "end")
+        self.ft_prev.insert("1.0", text)
+        self.ft_prev.configure(state="disabled")
+
+    def _ft_drop(self, key, paths):
+        """G1：拖入文件夹 -> 填入路径框（只取第一个，且必须是目录）。"""
+        if not paths:
+            return
+        p = paths[0]
+        self.ft[key].set(p)
+        if key == "output_root":
+            self.ft["seq"].set(str(FT.detect_next_seq(p)))
+        self._ft_refresh()
+
+    def _ft_pick_template(self):
+        p = filedialog.askdirectory(initialdir=self.ft["template_root"].get())
+        if p:
+            self.ft["template_root"].set(p)
+            self._ft_refresh()
+
+    def _ft_pick_output(self):
+        p = filedialog.askdirectory(initialdir=self.ft["output_root"].get())
+        if p:
+            self.ft["output_root"].set(p)
+            # 换输出目录时按新目录自动顺延序号（可手动覆盖）
+            self.ft["seq"].set(str(FT.detect_next_seq(p)))
+            self._ft_refresh()
+
+    def _ft_infer(self):
+        """F6：从输出根下「序号最大」的项目根提取 项目名/等级（不动日期与用户）。"""
+        info = FT.infer_fields_from_output(self.ft["output_root"].get().strip())
+        if not info:
+            messagebox.showwarning("无法提取", "输出路径下没有可识别的项目根文件夹")
+            return
+        self.ft["name"].set(info.get("name", ""))
+        self.ft["level"].set(info.get("level", ""))
+        self._ft_refresh()
+        self._log("页5 · 已从项目根提取：项目名=%s 等级=%s"
+                  % (info.get("name", ""), info.get("level", "")))
+
+    def _ft_plan(self):
+        """收集当前表单 -> (eps, errs, project_root, steps, warns, ep_names)。"""
+        g = lambda k: self.ft[k].get().strip()
+        eps, errs = FT.parse_episodes(g("eps"))
+        project_root, steps, warns, ep_names = FT.plan_creation(
+            eps, g("name"), g("seq"), g("level"), g("date"), g("user"),
+            g("output_root"), g("template_root"),
+            ptx_mode=self.ft_ptx.get(), ep_naming=self._ft_ep_key())
+        return eps, errs, project_root, steps, warns, ep_names
+
+    def _ft_refresh(self):
+        try:
+            eps, errs, project_root, steps, warns, ep_names = self._ft_plan()
+        except Exception as e:
+            self._ft_set_prev("[规划出错] %s" % e)
+            return
+        self.ft_example.set("示例: %s" % os.path.basename(project_root))
+        lines = []
+        if not self.ft["name"].get().strip():
+            lines.append("⚠ 项目名称为空 —— 集名/ptx 将只有集数。"
+                         "可点「从上次项目提取」自动填入。")
+        lines.append("项目根: %s" % project_root)
+        for e in errs:
+            lines.append("⚠ 集数解析: %s" % e)
+        for w in warns:
+            lines.append("⚠ %s" % w)
+        if not eps:
+            lines.append("(无有效集数，仅建立分类目录)")
+        lines.append("")
+        lines.append(FT.plan_tree_text(project_root, steps, ep_names))
+        self._ft_set_prev("\n".join(lines))
+
+    def _ft_build(self):
+        try:
+            eps, errs, project_root, steps, warns, ep_names = self._ft_plan()
+        except Exception as e:
+            messagebox.showerror("规划失败", str(e))
+            return
+        if not steps:
+            messagebox.showwarning("无可建立项", "请检查集数/模板路径")
+            return
+        # 建立前预检：问题一次列全，不等边建边炸
+        problems = FT.precheck_build(self.ft["template_root"].get().strip(),
+                                     self.ft["output_root"].get().strip(),
+                                     project_root, self.ft_ptx.get())
+        if problems and not messagebox.askokcancel(
+                "预检发现 %d 个问题" % len(problems),
+                "\n".join("· " + p for p in problems) + "\n\n仍要继续建立吗？"):
+            return
+        if not messagebox.askokcancel(
+                "确认建立",
+                "将在以下位置建立 %d 个目录/文件：\n%s\n\n是否继续？"
+                % (len(steps), project_root)):
+            return
+
+        src_ptx = (FT.locate_template_ptx(self.ft["template_root"].get().strip())
+                   if self.ft_ptx.get() != "none" else None)
+        skip = bool(self.ft_skip.get())
+        self._log("=== 页5 · 开始建立: %s ===" % project_root)
+        for w in warns:
+            self._log("⚠ %s" % w)
+        if errs:
+            self._log("⚠ 集数解析: %s" % "; ".join(errs))
+
+        def worker():
+            try:
+                created, skipped, failed = FT.apply_plan(
+                    project_root, steps, src_ptx=src_ptx, skip_existing=skip,
+                    log=lambda m: self.after(0, self._log, m))
+                self.after(0, self._log,
+                           "=== 页5 · 完成: 新建 %d / 跳过 %d / 失败 %d ==="
+                           % (created, skipped, failed))
+                if failed == 0:
+                    try:
+                        os.startfile(project_root)
+                    except Exception:
+                        pass
+                self.after(0, self._ft_refresh)
+            except Exception:
+                self.after(0, self._log, traceback.format_exc())
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _build_undo_tab(self):
+        f = self.tab_undo.inner
+        top = self._card(f, "回溯日志（每次执行自动生成 rename_log_*.csv）",
+                         fill="x", padx=PAD_LG, pady=(PAD_LG, PAD_SM))
+        top.columnconfigure(1, weight=1)
+
+        ttk.Label(top, text="日志文件:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.var_logfile = tk.StringVar(value="")
+        ttk.Entry(top, textvariable=self.var_logfile).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(top, text="选择…", command=self._pick_log).grid(row=0, column=2, padx=6)
+
+        row = ttk.Frame(top)
+        row.grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=(2, 6))
+        ttk.Button(row, text="列出目录下的日志", command=self._list_logs).pack(side="left", padx=(0, 8))
+        ttk.Button(row, text="✗ 清空日志目录", command=self._clear_logs,
+                   style="Danger.TButton").pack(side="left")
+
+        un = self._card(f, "撤销（把「新文件名」改回「原文件名」）",
+                        fill="both", expand=True, padx=10, pady=6)
+        ttk.Label(un, foreground=COLOR_WARN, justify="left",
+                  text=("撤销按日志逐条反向改名。若原文件名已被别的文件占用，该条会失败并跳过。\n"
+                        "执行前请确认目标目录没有新增同名文件。\n"
+                        "R1：执行前还会生成审计快照 rename_audit_*.json —— 就算执行中途退出，\n"
+                        "也能用「按审计回滚…」凭那份快照整批改回来。")).pack(anchor="w", padx=8, pady=6)
+
+        self.txt_preview_log = tk.Text(un, height=16, wrap="none", state="disabled",
+                                       font=("Consolas", 9))
+        ps = ttk.Scrollbar(un, orient="vertical", command=self.txt_preview_log.yview)
+        self.txt_preview_log.configure(yscrollcommand=ps.set)
+        ps.pack(side="right", fill="y", padx=(0, 6), pady=6)
+        self.txt_preview_log.pack(fill="both", expand=True, side="left", padx=8, pady=6)
+        # v3.14.0 P0-C2：空态引导（tag 灰色，写入方 delete 后自动消失，
+        # 正文不继承颜色）
+        self.txt_preview_log.tag_configure("hint", foreground="#9a9a9a")
+        self.txt_preview_log.configure(state="normal")
+        self.txt_preview_log.insert(
+            "1.0", "（空）选择一份回溯日志 rename_log_*.csv → 「读取并预览」\n"
+                   "确认无误后点「执行撤销」，把 [新文件名] 改回 [原文件名]。",
+            "hint")
+        self.txt_preview_log.configure(state="disabled")
+
+        ub = ttk.Frame(f)
+        ub.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(ub, text="执行撤销", command=self._on_undo).pack(side="right", padx=4)
+        ttk.Button(ub, text="读取并预览", command=self._preview_log).pack(side="right", padx=4)
+        ttk.Button(ub, text="按审计回滚…", command=self._undo_from_audit).pack(side="left")
+
+    # ------------------------------------------------------------------
+    # 交互
+    # ------------------------------------------------------------------
+    def _center_on_screen(self):
+        try:
+            self.update_idletasks()
+            w = self.winfo_width() or 1280
+            h = self.winfo_height() or 820
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            self.geometry("+%d+%d" % (max(0, (sw - w) // 2), max(0, (sh - h) // 3)))
+        except tk.TclError:
+            pass
+
+    def _log(self, text):
+        self.txt_log.configure(state="normal")
+        self.txt_log.insert("end", text.rstrip() + "\n")
+        self.txt_log.see("end")
+        self.txt_log.configure(state="disabled")
+
+    def _pick_root(self):
+        p = filedialog.askdirectory(initialdir=self.var_root.get() or "D:\\")
+        if p:
+            self.var_root.set(p)
+            self._refresh_preview()
+
+    def _drop_root(self, paths):
+        """G1（v2.6.6 / B批）：拖入目标目录 —— 取首个路径并刷新预览。"""
+        p = paths[0]
+        self.var_root.set(p)
+        self._refresh_preview()
+
+    def _pick_log(self):
+        p = filedialog.askopenfilename(
+            initialdir=self.var_root.get() or "D:\\",
+            filetypes=[("CSV 日志", "*.csv"), ("全部文件", "*.*")])
+        if p:
+            self.var_logfile.set(p)
+            self._preview_log()
+
+    # ---- 当前字段与规则 ----
+    def _fields(self):
+        return {k: v.get().strip() for k, v in self.field_vars.items()}
+
+    def _exts(self):
+        raw = (self.var_exts.get() or "").replace(",", " ").split()
+        return tuple(e if e.startswith(".") else "." + e for e in raw) or None
+
+    # ---- 计划 ----
+    def _refresh_preview(self):
+        """重建计划表（同时更新实时样例）。这是「生成计划」的唯一入口。"""
+        # 1) 样例（用兜底模板，即模板库第 1 条）
+        try:
+            sample = CORE.render(self._global_template(), "1", "DX BUS",
+                                 self._fields()) + ".wav"
+        except Exception as e:
+            sample = "[模板错误] %s" % e
+        self.var_sample.set(sample)
+
+        # 2) 扫描 + 计划
+        root = (self.var_root.get() or "").strip()
+        if not root or not os.path.isdir(root):
+            self.items, self.stats = [], {}
+            self._set_plan_state("目标目录不存在", "bad")
+            self._fill_plan([])
+            self.btn_apply.configure(state="disabled")
+            self.var_status.set("请选择一个存在的目标目录")
+            return
+
+        try:
+            paths = CORE.scan_dir(root, recursive=self.var_rec.get(),
+                                  exts=self._exts())
+            items, stats = CORE.make_plan(paths, self._global_template(),
+                                          self.rules, self._fields(),
+                                          targets=self.targets, root=root,
+                                          date_from_mtime=self.var_mtime_date.get(),
+                                          rename_ep_dirs=self.var_rename_dirs.get())
+            items, stats = self._apply_manual(items)
+        except Exception as e:
+            self.items, self.stats = [], {}
+            self._set_plan_state("规划失败: %s" % e, "bad")
+            self.btn_apply.configure(state="disabled")
+            return
+
+        self.items, self.stats = items, stats
+        self._fill_plan(items)
+        self._update_plan_state()
+        self._log_scan_stats()
+
+    # ---- R2：识别率统计行 ----
+    def _log_scan_stats(self):
+        """跑完输出统计行（X 文件 / 已合规 / 失败 / 清单）；
+        失败比例 ≥10% 时提示「识别规则可能需要补」。同为结果不变不重复刷。"""
+        s = self.stats
+        if not s or s.get("total", 0) == 0:
+            return
+        sig = tuple(sorted(s.items()))
+        if sig == self._last_stats_sig:
+            return
+        self._last_stats_sig = sig
+        total = s["total"]
+        bad = [i for i in self.items if i.status in ("error", "conflict")]
+        line = "统计：共 %d 个文件 · 待改名 %d · 已合规 %d" % (
+            total, s["rename"], s["skip"])
+        if s.get("excluded"):
+            line += " · 按目标排除 %d" % s["excluded"]
+        if s["error"]:
+            line += " · 识别失败 %d" % s["error"]
+        if s["conflict"]:
+            line += " · 冲突 %d" % s["conflict"]
+        self._log(line)
+        if bad:
+            self._log("失败/冲突清单（前 20 条）：")
+            for i in bad[:20]:
+                self._log("  · %s（%s）" % (os.path.basename(i.src),
+                                            (i.note or i.status).strip()))
+        if total and len(bad) * 10 >= total:
+            self._log("⚠ 失败比例 ≥10%%（%d/%d），识别规则可能需要补"
+                      "（页1 规则库 / 页2 模板与归位）。" % (len(bad), total))
+        _log = CFG.setup_logging()
+        if _log is not None:
+            _log.info("扫描统计: %s | 失败数=%d", line, len(bad))
+
+    def _apply_manual(self, items):
+        """把手动分类的覆盖应用回计划，并重算这些项的冲突状态。"""
+        if not self.manual:
+            return items, CORE.count_stats(items)
+        touched = False
+        for idx, i in enumerate(items):
+            ov = self.manual.get(os.path.normcase(i.src))
+            if not ov:
+                continue
+            items[idx] = CORE.manual_plan_item(
+                i.src, ov.get("ep", ""), ov.get("target", ""), ov.get("info", ""),
+                self._global_template(), self._fields(),
+                root=(self.var_root.get() or "").strip(), targets=self.targets,
+                rename_ep_dirs=self.var_rename_dirs.get())
+            touched = True
+        if not touched:
+            return items, CORE.count_stats(items)
+        CORE.mark_conflicts(items)
+        return items, CORE.count_stats(items)
+
+    def _update_plan_state(self):
+        s = self.stats
+        if not s or s["total"] == 0:
+            self._set_plan_state("该目录下没有可处理的文件", "warn")
+            self.btn_apply.configure(state="disabled")
+        elif s["rename"] == 0:
+            n = s["skip"] + s["error"] + s["conflict"] + s.get("excluded", 0)
+            self._set_plan_state("无需改动（%d 个文件均已符合命名或已排除）" % n, "ok")
+            self.btn_apply.configure(state="disabled")
+        else:
+            msg = "待改名 %d" % s["rename"]
+            if s["skip"]:
+                msg += " / 已合规 %d" % s["skip"]
+            if s.get("excluded"):
+                msg += " / 按目标排除 %d" % s["excluded"]
+            if s["error"]:
+                msg += " / 识别失败 %d" % s["error"]
+            if s["conflict"]:
+                msg += " / 冲突 %d" % s["conflict"]
+            self._set_plan_state(msg, "warn" if (s["error"] or s["conflict"]) else "ok")
+            self.btn_apply.configure(state="normal")
+        self.var_status.set("扫描 %d 个文件 · %s" % (s["total"], self.var_plan_state.get()))
+
+    def _set_plan_state(self, text, kind):
+        style = {"ok": "Ok.TLabel", "bad": "Bad.TLabel", "warn": "Warn.TLabel"}.get(
+            kind, "Hint.TLabel")
+        self.var_plan_state.set(text)
+        self.lbl_plan_state.configure(style=style)
+
+    def _fill_plan(self, items):
+        self.tree_plan.delete(*self.tree_plan.get_children())
+        for n, i in enumerate(items):
+            st = i.status or "ok"
+            note = i.note
+            if os.path.normcase(i.src) in self.manual:
+                note = ("[人工分类] " + note).strip()
+            if not note and st == "ok":
+                note = "%s · %s集" % (i.target, CORE.normalize_ep(i.ep))
+            self.tree_plan.insert("", "end", iid=str(n), values=(
+                STATUS_TEXT.get(i.status, i.status),
+                os.path.basename(i.src),
+                os.path.basename(i.dst),
+                i.target,
+                note), tags=(st,))
+
+    # ---- 手动分类 ----
+    def _on_plan_dblclick(self, event):
+        row = self.tree_plan.identify_row(event.y)
+        if not row:
+            return
+        self.tree_plan.selection_set(row)
+        self._on_manual()
+
+    def _on_manual(self):
+        sel = self.tree_plan.selection()
+        if not sel:
+            messagebox.showinfo("未选中", "请先在计划表里选中一行（通常是「识别失败」的）。")
+            return
+        try:
+            item = self.items[int(sel[0])]
+        except (ValueError, IndexError):
+            return
+        if item.status in ("conflict",):
+            messagebox.showinfo("无需手动分类",
+                                "该行是「命名冲突」，不是识别失败 —— 请改页2 的目标/模板，"
+                                "或直接看目标名是否重复。")
+            return
+        self._open_manual_dialog(item)
+
+    def _open_manual_dialog(self, item):
+        """手动分类对话框：指定 集数 + 目标 + 轨道信息。"""
+        dlg = tk.Toplevel(self)
+        dlg.title("手动分类")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.geometry("560x300")
+
+        ttk.Label(dlg, text=os.path.basename(item.src), font=("", 10, "bold"),
+                  wraplength=520, justify="left").pack(anchor="w", padx=14, pady=(12, 4))
+        ttk.Label(dlg, foreground="#666", wraplength=520, justify="left",
+                  text="识别不出来的文件，人工指定它属于第几集、归哪个目标、轨道信息是什么。"
+                       "指定后会走与自动识别完全相同的命名逻辑。").pack(
+            anchor="w", padx=14, pady=(0, 10))
+
+        body = ttk.Frame(dlg)
+        body.pack(fill="x", padx=14)
+
+        # 预填：从文件名里挑第一段数字当集数候选
+        m = re.search(r"(\d+)", os.path.basename(item.src))
+        guess_ep = m.group(1) if m else item.ep
+        guess_info = CORE.guess_info_from_name(item.src)
+        ov = self.manual.get(os.path.normcase(item.src)) or {}
+
+        ttk.Label(body, text="集数:").grid(row=0, column=0, sticky="w", pady=5)
+        var_ep = tk.StringVar(value=str(ov.get("ep") or guess_ep or ""))
+        ttk.Entry(body, textvariable=var_ep, width=20).grid(row=0, column=1, sticky="w", pady=5)
+        ttk.Label(body, text="（只填数字，如 20）", style="Hint.TLabel").grid(
+            row=0, column=2, sticky="w", padx=8)
+
+        ttk.Label(body, text="目标:").grid(row=1, column=0, sticky="w", pady=5)
+        names = [t.get("name", "") for t in self.targets]
+        var_tgt = tk.StringVar(value=str(ov.get("target") or (names[0] if names else "STEM")))
+        cb = ttk.Combobox(body, textvariable=var_tgt, values=names, width=18,
+                          state="readonly")
+        cb.grid(row=1, column=1, sticky="w", pady=5)
+        ttk.Label(body, text="（放哪、用哪套模板由页2 目标表决定）",
+                  style="Hint.TLabel").grid(row=1, column=2, sticky="w", padx=8)
+
+        ttk.Label(body, text="轨道信息:").grid(row=2, column=0, sticky="w", pady=5)
+        var_info = tk.StringVar(value=str(ov.get("info") or guess_info or ""))
+        ttk.Entry(body, textvariable=var_info, width=32).grid(row=2, column=1,
+                                                              columnspan=2,
+                                                              sticky="we", pady=5)
+        ttk.Label(body, text="（会原样填进模板的 {轨道信息}，如 DX BUS / Ai FX 1）",
+                  style="Hint.TLabel").grid(row=3, column=1, columnspan=2,
+                                            sticky="w", padx=0)
+
+        ttk.Label(dlg, text="预览:", style="Hint.TLabel").pack(anchor="w", padx=14,
+                                                              pady=(10, 0))
+        var_prev = tk.StringVar(value="")
+        ttk.Label(dlg, textvariable=var_prev, foreground=COLOR_OK,
+                  font=("Consolas", 10, "bold"), wraplength=520,
+                  justify="left").pack(anchor="w", padx=14)
+
+        def update_prev(*_a):
+            try:
+                tmp = CORE.manual_plan_item(
+                    item.src, var_ep.get().strip(), var_tgt.get().strip(),
+                    var_info.get().strip(), self._global_template(), self._fields(),
+                    root=(self.var_root.get() or "").strip(), targets=self.targets,
+                    rename_ep_dirs=self.var_rename_dirs.get())
+                var_prev.set("→ %s\\%s" % (os.path.basename(os.path.dirname(tmp.dst)),
+                                           os.path.basename(tmp.dst)))
+            except Exception as e:
+                var_prev.set("[无法预览] %s" % e)
+
+        for v in (var_ep, var_tgt, var_info):
+            v.trace_add("write", update_prev)
+        update_prev()
+
+        bf = ttk.Frame(dlg)
+        bf.pack(fill="x", padx=14, pady=12)
+
+        def ok():
+            ep = var_ep.get().strip()
+            if not ep.isdigit():
+                messagebox.showwarning("集数无效", "集数请填数字，如 20。", parent=dlg)
+                return
+            self.manual[os.path.normcase(item.src)] = {
+                "ep": ep, "target": var_tgt.get().strip(), "info": var_info.get().strip()}
+            dlg.destroy()
+            self._refresh_preview()
+
+        def clear():
+            self.manual.pop(os.path.normcase(item.src), None)
+            dlg.destroy()
+            self._refresh_preview()
+
+        ttk.Button(bf, text="取消", command=dlg.destroy).pack(side="right", padx=4)
+        ttk.Button(bf, text="确定", command=ok).pack(side="right", padx=4)
+        if os.path.normcase(item.src) in self.manual:
+            ttk.Button(bf, text="取消该条手动指定", command=clear).pack(side="left", padx=4)
+
+    # ---- 执行 ----
+    def _on_apply(self):
+        if self.busy:
+            return
+        todo = [i for i in self.items if i.status == ""]
+        if not todo:
+            messagebox.showinfo("无需改动", "当前计划里没有被标记为「待改名」的文件。")
+            return
+
+        bad = self.stats.get("error", 0) + self.stats.get("conflict", 0)
+        warn = ("\n\n注意：另有 %d 个文件因识别失败或命名冲突将被跳过。" % bad) if bad else ""
+        if not messagebox.askokcancel(
+                "确认执行重命名",
+                "即将重命名/移动 %d 个文件。\n\n"
+                "· 会生成回溯日志 rename_log_*.csv，可随时撤销\n"
+                "· 如有同名文件将按计划跳过（不会覆盖）%s\n\n"
+                "是否继续？" % (len(todo), warn)):
+            return
+
+        self.busy = True
+        self.btn_apply.configure(state="disabled")
+        self._log("=== 开始执行：待处理 %d ===" % len(todo))
+
+        def worker():
+            try:
+                # R1（v1.5.0）：执行前先落审计 json —— 就算中途崩溃，
+                # 目标目录旁也有一份完整的「原→新」清单可供回滚。
+                audit_path = self._write_audit(todo)
+                if audit_path:
+                    self._log("审计文件: %s（%d 条）" % (audit_path, len(todo)))
+                done, failed, _ = CORE.apply_plan(self.items, write_log=False)
+                _log = CFG.setup_logging()
+                if _log is not None:
+                    _log.info("执行重命名：成功 %d / 失败 %d", len(done), len(failed))
+                self._log("完成: 成功 %d / 失败 %d" % (len(done), len(failed)))
+                for src, dst, err in failed:
+                    self._log("  失败: %s -> %s (%s)" % (os.path.basename(src),
+                                                         os.path.basename(dst), err))
+                logp = self._write_log(done)
+                if logp:
+                    self.last_log = logp
+                    self._log("回溯日志: %s（%d 条）" % (logp, len(done)))
+                    self.after(0, lambda: self.var_logfile.set(logp))
+                # v1.3.0：集目录改名后旧目录可能空了 —— 只提醒，不自动删
+                try:
+                    emptied = CORE.list_emptied_dirs(self.items)
+                except Exception:
+                    emptied = []
+                if emptied:
+                    self._log("⚠ 以下原集目录已空，可自行回收（工具不代删）：")
+                    for d in emptied:
+                        self._log("  空目录: %s" % d)
+            except Exception:
+                self._log(traceback.format_exc())
+            finally:
+                self.busy = False
+                self.after(0, self._after_apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _write_log(self, rows):
+        if not rows:
+            return None
+        base = os.path.dirname(rows[0][0]) or "."
+        path = os.path.join(base, "rename_log_%s.csv"
+                            % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        try:
+            import csv
+            with open(path, "w", encoding="utf-8-sig", newline="") as fp:
+                w = csv.writer(fp)
+                w.writerow(CORE.LOG_HEADER)
+                w.writerows(rows)
+            return path
+        except OSError as e:
+            self._log("  警告: 日志写入失败 (%s)" % e)
+            return None
+
+    def _write_audit(self, todo):
+        """R1（v1.5.0）：执行前把「原→新」计划落成审计 json（rename_audit_*.json）。
+
+        与回溯日志（执行成功后才写）互补：审计覆盖"执行到一半崩了"的场景。
+        写失败只告警不阻断执行（改名的第一步保护仍有两阶段提交 + 回溯日志）。
+        """
+        if not todo:
+            return None
+        rows = [[os.path.abspath(i.src), os.path.abspath(i.dst)] for i in todo]
+        base = os.path.dirname(rows[0][0]) or "."
+        path = os.path.join(base, "rename_audit_%s.json"
+                            % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        meta = {"count": len(rows), "root": (self.var_root.get() or "").strip()}
+        try:
+            CORE.write_audit(path, rows, meta)
+            return path
+        except Exception as e:
+            self._log("  警告: 审计文件写入失败 (%s)" % e)
+            return None
+
+    def _after_apply(self):
+        self._log("=== 执行结束，重新扫描 ===")
+        self.manual.clear()          # 落盘后手动指定已完成使命
+        self._refresh_preview()
+        if self.last_log:
+            self.var_logfile.set(self.last_log)
+            self._preview_log()
+
+    # ---- 撤销 ----
+    def _list_logs(self):
+        root = (self.var_root.get() or "").strip()
+        if not root or not os.path.isdir(root):
+            messagebox.showwarning("目录无效", "请先在「预览与执行」页选择目标目录。")
+            return
+        found = []
+        for dp, _dn, fns in os.walk(root):
+            for fn in fns:
+                if fn.lower().startswith("rename_log_") and fn.lower().endswith(".csv"):
+                    found.append(os.path.join(dp, fn))
+        if not found:
+            messagebox.showinfo("未找到日志", "该目录下没有 rename_log_*.csv")
+            return
+        found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        dlg = tk.Toplevel(self)
+        dlg.title("选择回溯日志")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.geometry("760x360")
+        lb = tk.Listbox(dlg, font=("Consolas", 9))
+        lb.pack(fill="both", expand=True, padx=8, pady=8)
+        for p in found:
+            lb.insert("end", p)
+        lb.selection_set(0)
+
+        def choose():
+            sel = lb.curselection()
+            if sel:
+                self.var_logfile.set(lb.get(sel[0]))
+                self._preview_log()
+            dlg.destroy()
+
+        bf = ttk.Frame(dlg)
+        bf.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(bf, text="选用", command=choose).pack(side="right", padx=4)
+        ttk.Button(bf, text="取消", command=dlg.destroy).pack(side="right", padx=4)
+        lb.bind("<Double-Button-1>", lambda e: choose())
+
+    def _clear_logs(self):
+        root = (self.var_root.get() or "").strip()
+        if not root or not os.path.isdir(root):
+            return
+        found = []
+        for dp, _dn, fns in os.walk(root):
+            for fn in fns:
+                if fn.lower().startswith("rename_log_") and fn.lower().endswith(".csv"):
+                    found.append(os.path.join(dp, fn))
+        if not found:
+            messagebox.showinfo("无日志", "该目录下没有 rename_log_*.csv")
+            return
+        if not messagebox.askokcancel(
+                "确认清理", "将删除 %d 个回溯日志文件（不可恢复）：\n%s" %
+                (len(found), "\n".join(os.path.basename(p) for p in found[:10]))):
+            return
+        n = 0
+        for p in found:
+            try:
+                os.remove(p)
+                n += 1
+            except OSError:
+                pass
+        self._log("已清理 %d 个日志文件" % n)
+
+    def _preview_log(self):
+        p = (self.var_logfile.get() or "").strip()
+        self.txt_preview_log.configure(state="normal")
+        self.txt_preview_log.delete("1.0", "end")
+        if not p or not os.path.isfile(p):
+            self.txt_preview_log.insert("1.0", "（未选择有效的日志文件）")
+            self.txt_preview_log.configure(state="disabled")
+            return
+        try:
+            import csv
+            with open(p, "r", encoding="utf-8-sig", newline="") as fh:
+                rows = list(csv.reader(fh))
+            body = rows[1:] if rows and rows[0][:2] == CORE.LOG_HEADER else rows
+            lines = ["日志: %s" % p,
+                     "共 %d 条记录（倒序撤销）" % len(body), ""]
+            for r in body:
+                if len(r) >= 2:
+                    ok = "✓" if os.path.exists(r[1]) else "✗ 新文件不存在"
+                    lines.append("%s  %s\n      → %s" % (ok, os.path.basename(r[0]),
+                                                        os.path.basename(r[1])))
+            self.txt_preview_log.insert("1.0", "\n".join(lines))
+        except Exception as e:
+            self.txt_preview_log.insert("1.0", "读取失败: %s" % e)
+        self.txt_preview_log.configure(state="disabled")
+
+    def _on_undo(self):
+        p = (self.var_logfile.get() or "").strip()
+        if not p or not os.path.isfile(p):
+            messagebox.showwarning("未选日志", "请先选择一份回溯日志。")
+            return
+        if not messagebox.askokcancel(
+                "确认撤销",
+                "将按日志把文件改回原文件名：\n%s\n\n"
+                "已存在的原文件不会被覆盖（该条跳过）。是否继续？" % p):
+            return
+        done, failed = CORE.undo_from_log(p)
+        _log = CFG.setup_logging()
+        if _log is not None:
+            _log.info("撤销（%s）：成功 %d / 失败 %d", p, len(done), len(failed))
+        self._log("=== 撤销完成: 成功 %d / 失败 %d ===" % (len(done), len(failed)))
+        for a, b, err in failed:
+            self._log("  失败: %s (%s)" % (os.path.basename(a), err))
+        self._preview_log()
+        self._refresh_preview()
+
+    # ---- 审计回滚（R1 · v1.5.0）----
+    def _list_audits(self):
+        """列出目标目录树下的 rename_audit_*.json，弹窗选择，返回路径或 None。"""
+        root = (self.var_root.get() or "").strip()
+        if not root or not os.path.isdir(root):
+            messagebox.showwarning("目录无效", "请先在「预览与执行」页选择目标目录。")
+            return None
+        found = []
+        for dp, _dn, fns in os.walk(root):
+            for fn in fns:
+                if fn.lower().startswith("rename_audit_") and fn.lower().endswith(".json"):
+                    found.append(os.path.join(dp, fn))
+        if not found:
+            messagebox.showinfo("未找到审计文件",
+                                "该目录下没有 rename_audit_*.json\n"
+                                "（审计文件在每次「执行」前自动生成）")
+            return None
+        found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+
+        infos = []
+        for p in found:
+            try:
+                rows, meta = CORE.load_audit(p)
+                infos.append((p, "%s   （%d 条 · %s）"
+                              % (os.path.basename(p), len(rows),
+                                 meta.get("created", "?"))))
+            except Exception:
+                infos.append((p, os.path.basename(p) + "   （读取失败）"))
+        dlg = tk.Toplevel(self)
+        dlg.title("选择审计快照")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.geometry("760x360")
+        lb = tk.Listbox(dlg, font=("Consolas", 9))
+        lb.pack(fill="both", expand=True, padx=8, pady=8)
+        for _p, label in infos:
+            lb.insert("end", label)
+        lb.selection_set(0)
+        result = {"p": None}
+
+        def choose():
+            sel = lb.curselection()
+            if sel:
+                result["p"] = infos[sel[0]][0]
+            dlg.destroy()
+
+        bf = ttk.Frame(dlg)
+        bf.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(bf, text="选用", command=choose).pack(side="right", padx=4)
+        ttk.Button(bf, text="取消", command=dlg.destroy).pack(side="right", padx=4)
+        lb.bind("<Double-Button-1>", lambda e: choose())
+        dlg.wait_window()
+        return result["p"]
+
+    def _undo_from_audit(self):
+        """「按上次审计回滚」入口：凭执行前的 rename_audit_*.json 整批改回。"""
+        p = self._list_audits()
+        if not p:
+            return
+        try:
+            rows, meta = CORE.load_audit(p)
+        except Exception as e:
+            messagebox.showerror("审计文件无效", str(e))
+            return
+        if not rows:
+            messagebox.showinfo("空快照", "这份审计快照里没有任何改名记录。")
+            return
+        if not messagebox.askokcancel(
+                "确认按审计回滚",
+                "快照：%s\n记录：%d 条（创建于 %s）\n\n"
+                "将按快照把文件改回「原文件名」（倒序执行；原名被占用或新文件"
+                "不存在的条目跳过并报告）。是否继续？"
+                % (p, len(rows), meta.get("created", "?"))):
+            return
+        done, failed = CORE.undo_from_rows(rows)
+        _log = CFG.setup_logging()
+        if _log is not None:
+            _log.info("按审计回滚（%s）：成功 %d / 失败 %d", p, len(done), len(failed))
+        self._log("=== 按审计回滚完成: 成功 %d / 失败 %d ===" % (len(done), len(failed)))
+        for a, b, err in failed:
+            self._log("  失败: %s (%s)" % (os.path.basename(a), err))
+        self._refresh_preview()
+
+    # ---- 规则集导入导出（R3 · v1.5.0）----
+    RULES_EXPORT_KEYS = ("fields", "template", "templates", "targets", "rules",
+                         "date_from_mtime", "rename_ep_dirs")
+
+    def _collect_rules_payload(self):
+        """当前界面状态 → 规则集 dict（导出用；与 _save_cfg 同源同构）。"""
+        return {
+            "fields": self._fields(),
+            "template": self._global_template(),
+            "templates": [dict(t) for t in self.templates],
+            "targets": [dict(t) for t in self.targets],
+            "rules": [list(r) for r in self.rules],
+            "date_from_mtime": bool(self.var_mtime_date.get()),
+            "rename_ep_dirs": bool(self.var_rename_dirs.get()),
+        }
+
+    def _export_rules(self):
+        data = self._collect_rules_payload()
+        p = filedialog.asksaveasfilename(
+            title="导出规则集", defaultextension=".json",
+            initialfile="rename-unify-rules.json",
+            filetypes=[("JSON", "*.json"), ("全部文件", "*.*")])
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+        except OSError as e:
+            messagebox.showerror("导出失败", "规则集写入失败：%s" % e)
+            return
+        self._log("规则集已导出: %s" % p)
+        messagebox.showinfo("导出规则集", "已导出：%s\n（含 字段/模板库/目标表/识别规则/两个开关）" % p)
+
+    def _import_rules(self):
+        p = filedialog.askopenfilename(
+            title="导入规则集",
+            filetypes=[("JSON", "*.json"), ("全部文件", "*.*")])
+        if not p:
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("导入失败", "规则集读取失败：%s" % e)
+            return
+        if not isinstance(data, dict):
+            messagebox.showerror("导入失败", "格式不符：顶层应为 JSON 对象。")
+            return
+        applied = []
+        # 模板库 / 目标表 / 识别规则（结构合法才吃）
+        if isinstance(data.get("templates"), list):
+            self.templates = [dict(t) for t in data["templates"] if isinstance(t, dict)]
+            self._reload_templates()
+            applied.append("模板库 %d 套" % len(self.templates))
+        if isinstance(data.get("targets"), list):
+            self.targets = [dict(t) for t in data["targets"] if isinstance(t, dict)]
+            self._reload_targets()
+            applied.append("目标表 %d 项" % len(self.targets))
+        if isinstance(data.get("rules"), list):
+            self.rules = [list(r) for r in data["rules"]]
+            self._reload_rules()
+            applied.append("识别规则 %d 条" % len(self.rules))
+        # 字段（回填页1输入框）
+        if isinstance(data.get("fields"), dict) and data["fields"]:
+            for k, v in data["fields"].items():
+                var = self.field_vars.get(str(k))
+                if var is not None:
+                    var.set(str(v))
+            self._on_field_change()
+            applied.append("字段")
+        # 两个开关
+        if isinstance(data.get("date_from_mtime"), bool):
+            self.var_mtime_date.set(data["date_from_mtime"])
+            applied.append("mtime兜底开关")
+        if isinstance(data.get("rename_ep_dirs"), bool):
+            self.var_rename_dirs.set(data["rename_ep_dirs"])
+            applied.append("集目录改名开关")
+        self._save_cfg()
+        self._refresh_preview()
+        self._log("规则集已导入: %s（%s）" % (p, "、".join(applied) or "无有效内容"))
+        messagebox.showinfo("导入规则集",
+                            "已导入并保存：%s" % ("、".join(applied) or "无有效内容"))
+
+    # ---- 配置 ----
+    def _save_cfg(self):
+        cfg = dict(self.cfg)
+        cfg["last_root"] = self.var_root.get()
+        cfg["recursive"] = bool(self.var_rec.get())
+        cfg["exts"] = self.var_exts.get()
+        cfg["template"] = self._global_template()
+        cfg["fields"] = self._fields()
+        cfg["rules"] = [list(r) for r in self.rules]
+        cfg["templates"] = [dict(t) for t in self.templates]
+        cfg["targets"] = [dict(t) for t in self.targets]
+        cfg["foldertree"] = self._ft_collect()
+        try:
+            cfg["window"] = self.geometry().split("+")[0]
+        except Exception:
+            pass
+        if CFG.save_config(cfg):
+            self.cfg = CFG.load_config()
+            self._log("配置已保存: %s" % CFG.CONFIG_PATH)
+            self.var_status.set("配置已保存")
+        else:
+            messagebox.showerror("保存失败", "无法写入配置文件：\n%s" % CFG.CONFIG_PATH)
+
+
+def main():
+    _safe_io()
+    _log = CFG.setup_logging()
+    if _log is not None:
+        _log.info("GUI 启动 v%s (%s)", CFG.APP_VERSION, CFG.build_date())
+    try:
+        App().mainloop()
+    except Exception:
+        _safe_io()
+        tb = traceback.format_exc()
+        if _log is not None:
+            _log.error("启动异常：\n%s", tb)
+        try:
+            messagebox.showerror("启动失败", tb)
+        except Exception:
+            sys.stderr.write(tb)
+
+
+if __name__ == "__main__":
+    main()

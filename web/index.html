@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-mode="dark" data-style="glass">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pro Tools 工具箱 — v4 HTML 版（阶段 B）</title>
+<link rel="icon" href="assets/logos/p.ico">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>
+
+<!-- ① 头部卡：54px、单色强调线、右侧风格/主题切换 -->
+<header class="hero">
+  <img class="logo brand-mark" src="assets/logos/p.svg" alt="P">
+  <h1>Pro Tools 工具箱</h1><span class="ver">H版 v4.2.1</span>
+  <div class="spacer"></div>
+  
+  <button type="button" class="mode-sw" id="modeSw" title="切换主题">主题 · <span id="modeLabel">中性灰（深）</span></button>
+</header>
+
+<!-- ② 页签行 -->
+<nav class="tabs">
+  <button type="button" class="tab on" id="tab-scan"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 6 6"/></svg>扫描建档</button>
+  <button type="button" class="tab" id="tab-export"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 16v5h16v-5"/></svg>导出</button>
+  <button type="button" class="tab" id="tab-library"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 3h5v18H4zM11 3h5v18h-5zM18 4l3 16"/></svg>档案库</button>
+  <button type="button" class="tab" id="tab-clean"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7m4-7v7"/></svg>清理</button>
+</nav>
+
+<main>
+  <div class="warn" id="warnBar">⚠ Pro Tools 未连接（PTSL 127.0.0.1:31416 不通）——扫描/导出/交付包暂不可用；启动 Pro Tools 并加载工程后自动恢复。</div>
+
+  <!-- ══════════ 页 1：扫描建档 ══════════ -->
+  <section class="page on" id="page-scan">
+    <div class="cols">
+      <section class="card px-hl">
+        <h2>扫描建档 <span class="tag">PT → 工程档案</span></h2>
+        <div class="inner" style="margin-bottom:10px">
+          <b style="font-size:12.5px">本页功能</b>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px">
+            扫描当前 Pro Tools 工程，生成「工程档案」（<code>pt-profile.json</code>）：轨道、总线、主输出的清单与时长——导出页直接从档案取源，不会猜错名字；扫描一次即可反复使用。</div>
+        </div>
+        <div class="inner" style="margin-bottom:10px">
+          <b style="font-size:12.5px">扫描前提</b>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px">
+            <span style="color:var(--red)">● Pro Tools 未运行（PTSL 离线）</span>　请在 Pro Tools 中打开要导出的工程。</div>
+        </div>
+        <div class="field">
+          <label>输出目录（存档案）</label>
+          <input type="text" id="outDir" value="" placeholder="点「浏览…」选择目录">
+          <button class="btn ghost sm" id="btnBrowse">浏览…</button>
+        </div>
+        <div class="field">
+          <label>档案文件名</label>
+          <input type="text" id="profName" value="pt-profile.json">
+        </div>
+        <div style="margin-top:12px;display:flex;gap:10px">
+          <button class="btn primary" id="btnScan"> 扫描并生成档案</button>
+          <button class="btn ghost" id="btnStop" style="display:none">■ 中止</button>
+        </div>
+      </section>
+      <section class="card px-hl">
+        <h2>操作步骤</h2>
+        <ol class="steps">
+          <li>启动 Pro Tools 并打开工程</li>
+          <li>点左侧「扫描并生成档案」（只读，安全）</li>
+          <li>成功后档案自动应用，直接去「导出」页</li>
+        </ol>
+        <h2 style="margin-top:16px">生成交付包 <span class="tag">PT → 剪辑机，一步到位</span></h2>
+        <div class="inner" style="font-size:12px;color:var(--dim)">
+          扫描当前 PT 工程 → <code>pt-clips.json</code> + audio/ 素材，产出「解压即用」交付包（剪辑机器不需要 Pro Tools）。仅数据包：剪辑侧用剪辑工具「导入多轨 → 交付包 json（完全离线）」导入。
+        </div>
+        <div class="field" style="margin-top:10px">
+          <label>包输出目录</label>
+          <input type="text" id="pkgDir" value="" placeholder="点「浏览…」选择目录">
+          <button class="btn ghost sm" id="btnPkgBrowse">浏览…</button>
+        </div>
+        <button class="btn ghost" id="btnDeliver" style="width:100%">▸ 生成交付包</button>
+      </section>
+    </div>
+  </section>
+
+  <!-- ══════════ 页 2：导出 ══════════ -->
+  <section class="page" id="page-export">
+    <div class="cols eq">
+      <section class="card px-hl">
+        <h2>① 档案与源 <span class="tag">从档案取源，不猜名字</span></h2>
+        <div class="field">
+          <label>工程档案</label>
+          <input type="text" id="expProfilePath" value="" placeholder="浏览选择 或 在「档案库」页点选加载">
+          <button class="btn ghost sm" id="expBrowseProfile">浏览…</button>
+        </div>
+        <div class="inner" id="expProfileInfo" style="font-size:12px;color:var(--dim);margin-bottom:10px">尚未加载档案</div>
+        <b style="font-size:12.5px">源（轨道）</b>
+        <span id="srcCount" style="font-size:11.5px;color:var(--faint);margin-left:8px">已选 0 / 0 轨</span>
+        <div style="margin:6px 0;display:flex;gap:8px">
+          <button class="btn ghost sm" id="btnAll">全选</button>
+          <button class="btn ghost sm" id="btnNone">清空</button>
+          <button class="btn ghost sm" id="btnExcluded" title="被剔除空轨（可加回）">被剔除的 0 条 ▸</button>
+        </div>
+        <div class="tbl-wrap" id="trackTbl"><div class="empty">（加载档案后列出轨道）</div></div>
+      </section>
+      <section class="card px-hl">
+        <h2>② 模式与参数</h2>
+        <b style="font-size:12.5px">导出模式</b>
+        <div class="modes" style="margin:6px 0 10px">
+          <label class="check"><input type="checkbox" id="mdMix" checked><span><b>mix</b> — 整轨混音</span></label>
+          <label class="check"><input type="checkbox" id="mdBus"><span><b>bus</b> — 按总线分轨</span></label>
+          <label class="check"><input type="checkbox" id="mdStem"><span><b>stem</b> — 分轨（STEM）</span></label>
+          <label class="check"><input type="checkbox" id="mdTrack"><span><b>track</b> — 逐轨</span></label>
+        </div>
+        <label class="check"><input type="checkbox" id="mdStemAux"><span>STEM 附带辅助轨（aux）</span></label>
+        <label class="check"><input type="checkbox" id="mdExcludeEmpty" checked><span>排除空轨</span></label>
+        <div class="field"><label>工程会话（.ptx）</label><input type="text" id="expSession" placeholder="按需填写，用于时长/视频联动"></div>
+        <div class="field"><label>时间码范围</label>
+          <input type="text" id="expStart" value="00:00:00:00" placeholder="HH:MM:SS:FF 必填" style="flex:1">
+          <input type="text" id="expEnd" placeholder="HH:MM:SS:FF 必填（>开始）" style="flex:1">
+        </div>
+        <div class="field"><label>视频联动</label>
+          <button class="btn ghost sm" id="btnVideoDetect" title="按 .ptx 所在目录树检索视频，自动填结束时间码">⏱ 从工程视频自动填</button>
+          <span style="font-size:11.5px;color:var(--dim)">余量
+            <input type="text" id="expMargin" value="0" style="width:52px;padding:4px 6px;flex:none"> 秒
+            <span style="color:var(--faint)">（结束 = 视频时长 + 余量）</span></span>
+        </div>
+        <div class="field"><label>采样率 / 位深</label>
+          <select id="expSr"><option value="">默认</option><option>44100</option><option>48000</option><option>96000</option></select>
+          <select id="expBd"><option value="">默认</option><option>16</option><option>24</option><option>32</option></select>
+          <select id="expFmt">
+            <option value="interleaved">立体声/多声道 · 保留原宽度（每轨 1 个文件）</option>
+            <option value="multiple-mono">多单声道 · 立体声拆成 L/R 两个文件</option>
+            <option value="mono">单声道文件 · 立体声轨会被合并降混</option>
+          </select>
+        </div>
+        <div class="field"><label>输出目录</label>
+          <input type="text" id="expOutDir" value="" placeholder="点「浏览…」选择目录">
+          <button class="btn ghost sm" id="expBrowseOut">浏览…</button>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:10px">
+          <button class="btn ghost" id="btnPreview">▸ 预览命令（dry-run）</button>
+          <button class="btn primary" id="btnExport">⬇ 开始导出</button>
+        </div>
+        <div class="note">导出走后台进程，日志见下方；完成后输出根自动记入「档案库 → 导出历史」。</div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ══════════ 页 3：档案库 ══════════ -->
+  <section class="page" id="page-library">
+    <section class="card px-hl">
+      <h2>档案库 <span class="tag">档案目录平铺管理：搜索 / 加载 / 删除（回收站）</span></h2>
+      <div class="field"><label>档案目录</label>
+        <span id="libDir" style="flex:1;font-size:12px;color:var(--dim)">（未设置）</span>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;margin:8px 0">
+        <input type="text" class="search" id="libSearch" placeholder="搜索档案文件名…">
+        <button class="btn ghost sm" id="libRefresh">刷新</button>
+        <div style="flex:1"></div>
+        <button class="btn ghost sm" id="libOpenDir">打开目录</button>
+        <button class="btn danger sm" id="libDelete">✗ 删除（回收站）</button>
+      </div>
+      <div class="tbl-wrap" style="max-height:260px" id="libWrap"><div class="empty">（加载中…）</div></div>
+      <h2 style="margin-top:16px">导出历史 <span class="tag">输出根里的工程文件夹（双击打开）</span></h2>
+      <div class="tbl-wrap" style="max-height:180px" id="histWrap"><div class="empty">（加载中…）</div></div>
+    </section>
+  </section>
+
+  <!-- ══════════ 页 4：清理 ══════════ -->
+  <section class="page" id="page-clean">
+    <div class="warn" style="background:#b00;color:#fff;border-color:#b00">危险操作说明：清理会按档案轨道清单删除输出目录中的中间产物——请先确认档案正确。</div>
+    <section class="card px-hl">
+      <h2>清理目标 <span class="tag">以当前加载档案的轨道清单为参照</span></h2>
+      <div class="inner" style="margin-bottom:10px;font-size:12px;color:var(--dim)">
+        · 清理动作在导出完成后按需执行；<br>
+        · 中间文件默认移入备份子目录，不直接硬删；<br>
+        · 本页清单随「扫描建档 / 档案库」页加载的档案实时刷新。
+      </div>
+      <div class="tbl-wrap" id="cleanTbl"><div class="empty">（尚未加载档案）</div></div>
+    </section>
+  </section>
+
+  <!-- ⑤ 日志区（全局共用） -->
+  <div class="logwrap">
+    <div class="loghead">
+      <b>运行日志</b><span class="cnt" id="logCnt">（0 条）</span>
+      <div class="spacer"></div>
+      <span style="font-size:11px;color:var(--faint)">耗时操作在后台执行，请留意底部状态</span>
+    </div>
+    <div class="log" id="log"><div class="info">— 就绪。等待操作 —</div></div>
+    <div class="log-actions">
+      <button class="btn ghost sm" id="btnClear">清空日志</button>
+    </div>
+  </div>
+</main>
+
+<!-- ⑥ 状态条 -->
+<footer class="status">
+  <span><span class="dot off" id="ptslDot"></span><span id="ptslText">PTSL 离线（请先启动 Pro Tools）</span></span>
+  <div class="spacer"></div>
+  <span class="badge" id="skillBadge">技能检查</span>
+</footer>
+
+<div class="demo-tip" id="demoTip" style="display:none">演示态（未检测到壳桥接）· 外观预览可用</div>
+
+<!-- B2 补齐：通用小窗（被剔除轨道 / 多视频选择） -->
+<div class="modal-mask" id="modalMask" style="display:none">
+  <div class="modal" id="modalBox"></div>
+</div>
+
+<script src="js/i18n.js"></script>
+<script src="js/preferences.js"></script>
+<script src="js/app.js"></script>
+<script src="js/glass-tuner.js"></script>
+</body>
+</html>

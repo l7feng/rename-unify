@@ -1,0 +1,3128 @@
+# -*- coding: utf-8 -*-
+"""pt-tools 主窗口与页签（W1 三层拆分 · gui/app）。
+
+唯一 GUI 层：只负责收集参数 → 调 core/naming.build_export_cmds →
+交给 worker/runner.CmdWorker 后台执行；领域逻辑一律在 core。
+"""
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+from ptools.core.config import load_config, save_config
+from ptools.core.i18n import T, get_lang, set_lang, LANG_EN, LANG_ZH
+from ptools.core.logs import setup_logging
+from ptools.core.naming import (
+    build_export_cmds, fmt_choices, fmt_display_of, fmt_key_of,
+    fmt_label, fmt_tc_ok, frame_to_tc, load_profile, open_in_explorer,
+    parse_video_duration_output, tc_to_frame,
+)
+from ptools.core.notify import toast
+from ptools.core.paths import PathResolver
+from ptools.gui.columns import fit_tree_columns
+from ptools.gui.scrollable import ScrollableFrame
+from ptools.gui.theme import (apply as apply_theme, initial_geometry, window_size,
+    PAD_XS, PAD_SM, PAD_MD, PAD_LG, PAD_XL, PAD_STATUSBAR, FONT_SMALL,
+    set_theme, list_themes, current_theme_name, buttonize, DEFAULT_THEME,
+    set_button_style, list_button_styles, current_button_style, get_colors,
+    ICON_PLAY, ICON_STOP, ICON_DOWN, ICON_GEAR, ICON_CHECK, ICON_CROSS,
+    ICON_PLUS, ICON_REFRESH, ICON_FOLDER, ICON_SCAN, ICON_SAVE, ParticleCanvas)
+from ptools.gui.widgets import (StatusLED, Tooltip, CollapsibleFrame, IconButton,
+    ToggleSwitch, Badge, ProgressRing, attach_tree_hover, attach_drop_highlight,
+    attach_tooltip, HoverCard, draw_icon, auto_tooltip, HeroHeader, Segmented,
+    GlassCard, PixelCard, PixelButton, refresh_cards)
+from ptools.core.settings import (
+    APP_DIR, BIT_DEPTHS, CREATE_NO_WINDOW, DEFAULT_DELIVERY_ROOT,
+    DEFAULT_EXPORT_FORMAT, DEFAULT_FALLBACK_DURATION, DEFAULT_VIDEO_MARGIN,
+    EXPORT_MODES, FORMAT_FOLLOW, SAMPLE_RATES, TRACK_FMT_CYCLE,
+)
+from ptools.worker.runner import CmdWorker, ptsl_online
+
+# ---------------------------------------------------------------------------
+# 主窗口
+# ---------------------------------------------------------------------------
+
+def center_on_parent(win, parent):
+    """v2.6.5（P2）：Toplevel 相对父窗居中。
+
+    旧版所有 Toplevel 都不设位置，tkinter 默认把它们摆在父窗左上角附近——
+    用户反馈「弹窗出现在导出模式的位置」正好盖住该区块。统一改为相对父窗居中。
+    """
+    try:
+        win.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        ww, wh = win.winfo_width(), win.winfo_height()
+        x = px + max(0, (pw - ww) // 2)
+        y = py + max(0, (ph - wh) // 2)
+        win.geometry("+%d+%d" % (x, y))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# G1（v2.6.6）：拖拽支持 —— tkinterdnd2 缺席时安全回退（无拖拽能力，不报错）
+# ---------------------------------------------------------------------------
+
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES as _DND_FILES
+    _TKDND_OK = True
+except ImportError:
+    TkinterDnD = None
+    _TKDND_OK = False
+
+# 根窗口基类：tkinterdnd2 在场用它的 Tk（否则 drop_target_register 不存在），
+# 缺席回落普通 tk.Tk —— **两条路径都必须给 _DND_BASE 赋值**。
+# 曾经的 bug：只在 try 分支置 _TKDND_OK，_DND_BASE 从未定义，于是
+# `class App(_DND_BASE if _TKDND_OK else tk.Tk)` 在「装了 tkinterdnd2」的机器上
+# （含全部已发布 exe —— tkinterdnd2 被打进 _internal）抛 NameError，
+# pt-tools 双击即崩「Unhandled exception in script」。
+_DND_BASE = TkinterDnD.Tk if _TKDND_OK else tk.Tk
+
+
+def split_dnd_data(data):
+    """tkinterdnd2 的 drop 数据 → 路径列表（含空格路径是 {..} 花括号包裹）。"""
+    out = []
+    for tok in re.findall(r"\{[^}]*\}|\S+", data or ""):
+        out.append(tok.strip("{}"))
+    return [p for p in out if p]
+
+
+def enable_path_drop(entry, on_drop):
+    """给 Entry 注册文件夹/文件拖入；拖入后回调 on_drop(路径列表)。
+
+    tkinterdnd2 不可用（未安装/打包未带）时静默跳过，保持原有无拖拽行为。
+    """
+    if not _TKDND_OK:
+        return False
+
+    def _handle(e):
+        paths = split_dnd_data(e.data)
+        if paths:
+            on_drop(paths)
+        return e.action
+
+    entry.drop_target_register(_DND_FILES)
+    entry.dnd_bind("<<Drop>>", _handle)
+    return True
+
+
+class App(_DND_BASE):
+    def __init__(self):
+        super().__init__()
+        # 三重保险消除 Tk 启动闪窗：
+        #  Tk() 创建根窗口即按默认标题 "tk" 映射；withdraw 隐藏（窗口 unmapped，
+        #  不可见也不接收输入），overrideredirect 使其不进任务栏，alpha=0 全透明
+        #  兜底最后一张渲染帧。全部构建完成后一次性恢复显示。
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-alpha", 0.0)
+
+        # 样式必须绑定本 root 配置（显式 master=self）。
+        # 曾经的 bug：ttk.Style().configure(...) 在 App() 之前调用 —— 那时还没有任何
+        # root，ttk.Style() 会隐式创建一个默认 Tk() root（标题 'tk'）；App() 随后再建
+        # 第二个 root，结果永久残留一个空白「tk」小窗（withdraw 只作用于第二个 root）。
+        # 传 master=self 保证复用本 root，绝不产生第二个窗口。
+        try:
+            ttk.Style(master=self).configure("Danger.TFrame", background="#b00")
+        except tk.TclError:
+            pass
+
+        self.cfg = load_config()
+        set_lang(self.cfg.get("lang", LANG_ZH))
+        self.logger = setup_logging()
+        if self.logger is not None:
+            self.logger.info("语言=%s 技能目录=%s",
+                             self.cfg.get("lang"),
+                             self.cfg.get("skills_root") or "(探测中)")
+        self.resolver, _ok, _msg = PathResolver.detect(self.cfg)
+        self.profile_path = self.cfg.get("last_profile", "")
+        self.profile_data = None
+        self.ptsl_on = False
+
+        self.out_queue = queue.Queue()
+        self.workers = []
+        self.active_worker = None      # v1.3.0：当前在跑的 worker（中止按钮用）
+        self._vars = {}
+
+        self._build_ui()
+        self._restore_profile_to_tabs()
+
+        # v1.3.0：点 X 一定关得掉。
+        # 旧行为的根因之二：App 从未注册 WM_DELETE_WINDOW，destroy 之后主线程试图
+        # 退出却被 subprocess 的 atexit 钩子挂住（它在等仍存活的子进程）。
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.after(100, self._poll_queue)
+        self.after(1000, self._poll_ptsl)
+        self._refresh_resolver_status()
+        if self.profile_path:
+            self._try_load_profile(self.profile_path)
+
+        # 控件就绪后一次性显示
+        self._center_on_screen()
+        self.overrideredirect(False)
+        self.attributes("-alpha", 1.0)
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _center_on_screen(self):
+        """把窗口摆到屏幕中央（避免出现在左上角默认位置）"""
+        try:
+            self.update_idletasks()
+            w = self.winfo_width() or 860
+            h = self.winfo_height() or 680
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 3)
+            self.geometry("+%d+%d" % (x, y))
+        except tk.TclError:
+            pass
+
+    # ---------------- UI 构建 / 重建 ----------------
+
+    def _build_ui(self):
+        # v3.14.0 A1 修复：cfg["button_style"] 进启动链 —— 原只传 theme，
+        # 重启后风格档案永远回退默认（v3.12.1 持久化只写不读的老缺口，
+        # C2.5 加 glass 档案后显性化：实拍 glass 档不生效即此根因）。
+        apply_theme(self, theme_name=self.cfg.get("theme"),
+                    button_style=self.cfg.get("button_style"))   # S13：共享主题（读 cfg["theme"]，默认 warm）
+        buttonize(self)   # S13-v2：按钮悬停变手型 + 图标
+        # S13-v3：动态背景层（底层，cfg["particle_bg"]=False 可关闭）。
+        # v3.14.0 A1（裁决 14-6④）：双模式 —— pixel=方块粒子 / glass=水波纹；
+        # 模式跟随按钮风格档案（pixel→粒子，glass→波纹），切换见 _set_button_style。
+        _pmode = "glass" if self.cfg.get("button_style") == "glass" else "pixel"
+        self.particle = ParticleCanvas(self, enabled=bool(self.cfg.get("particle_bg", True)),
+                                        theme_name=self.cfg.get("theme"), mode=_pmode)
+        self.particle.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.tk.call("lower", str(self.particle))
+        self.title(T("app_title"))
+        # S12：窗口几何 —— cfg 有记录用记录（钳到 minsize）；无记录按屏幕自适应；
+        # 语言切换重建 UI 时窗口已在屏上，保留当前几何不重置。
+        if self.cfg.get("window"):
+            self.geometry(initial_geometry(self.cfg["window"], self))
+        elif not self.winfo_ismapped():
+            self.geometry(initial_geometry(None, self))
+        self.minsize(900, 620)
+        self._build_menubar()
+        # v3.13.0（阶段A样板）：HeroHeader 顶横幅 —— 家族视觉统一（剪映/rename 已有）。
+        # 原灰底版本适配条从「第二横幅」降级为一行灰字 caption（层级：说明≠警报），
+        # 离线黄条仅在 PT 离线时出现（保持 P1 行为不变）。
+        try:
+            from ptools.core.settings import APP_VERSION, build_date
+            hero_sub = "v%s · %s" % (APP_VERSION, build_date())
+        except Exception:
+            hero_sub = current_theme_name()
+        self.hero = HeroHeader(self, title=T("hero_title"), subtitle=hero_sub,
+                               icon="layers")
+        _pal = get_colors()
+        self.pt_info = tk.Label(self, text=T("pt_info_bar"), fg=_pal["FG_DIM"],
+                                bg=_pal["BG"], anchor="w", justify="left",
+                                font=FONT_SMALL, padx=PAD_LG, pady=2,
+                                wraplength=860)
+        # P1（v1.5.0）：PT 离线常驻黄条 —— 离线时一眼可见，不再"点了按钮才深处报错"。
+        # 在线时由 _poll_ptsl pack_forget 隐藏；整窗重建（语言切换）按当时状态重挂。
+        # v3.14.0 A2：满宽大块 → 窄条（make_banner，与清理页红条同款）。
+        self.pt_warn = make_banner(self, T("pt_warn_bar"), "warn")
+        self._warn_packed = False
+        nb = ttk.Notebook(self)
+        self.nb = nb
+        nb.pack(fill="both", expand=True, padx=PAD_LG, pady=(PAD_SM, 0))
+        self.hero.pack(fill="x", padx=PAD_LG, pady=(PAD_SM, 0), before=self.nb)
+        # v3.13.0 C2.5：头部右侧 Canvas 分段风格切换器
+        #（像素 Pixel / 玻璃 Glass / 圆润 Rounded，移动指示器、记忆选择）
+        try:
+            self.style_seg = Segmented(self.hero.right,
+                                       options=list_button_styles(),
+                                       value=current_button_style(),
+                                       command=self._set_button_style,
+                                       bg=self.hero._bg, padx=10, pady=5)
+            self.style_seg.pack(side="right", padx=(10, 0))
+        except Exception:
+            self.style_seg = None
+        self.pt_info.pack(fill="x", padx=PAD_LG, pady=(2, 0), before=self.nb)
+        # G2/J12（D2 · 2026-09-27）：四页统一套可滚动容器 —— 信息密页窗口
+        # 不够高时右侧出滚动条；tab 对象引用不变（set_ptsl 等照旧直调）。
+        def _scroll_tab(cls, text):
+            wrap = ScrollableFrame(nb, padding=0)
+            tab = cls(wrap.inner, self)
+            tab.pack(fill="both", expand=True)
+            nb.add(wrap, text=text)
+            return tab
+
+        self.scan_tab = _scroll_tab(ScanTab, "🔍 " + T("tab_scan"))
+        self.export_tab = _scroll_tab(ExportTab, "⬇ " + T("tab_export"))
+        self.library_tab = _scroll_tab(LibraryTab, "📚 " + T("tab_library"))
+        self.clean_tab = _scroll_tab(CleanTab, "🧹 " + T("tab_clean"))
+        self._build_log()
+        self._build_statusbar()
+        if not self.ptsl_on:
+            self._show_warn_bar()
+        self.after(600, self._auto_enhance)
+
+    def _show_warn_bar(self):
+        """P1：挂出离线黄条（幂等）。"""
+        if getattr(self, "_warn_packed", False):
+            return
+        try:
+            self.pt_warn.pack(fill="x", padx=8, pady=(6, 0), before=self.nb)
+            self._warn_packed = True
+        except tk.TclError:
+            pass
+
+    def _hide_warn_bar(self):
+        """P1：收起离线黄条（幂等）。"""
+        if not getattr(self, "_warn_packed", False):
+            return
+        try:
+            self.pt_warn.pack_forget()
+        except tk.TclError:
+            pass
+        self._warn_packed = False
+
+    def _rebuild_ui(self):
+        """语言切换/设置变更后整体重建（StringVar 快照恢复）"""
+        vals = self._snapshot_vars()
+        for w in self.winfo_children():
+            w.destroy()
+        self._build_ui()
+        self._restore_vars(vals)
+        self._restore_profile_to_tabs()
+        self._refresh_resolver_status()
+        self.scan_tab.set_ptsl(self.ptsl_on)
+        self._refresh_gating()
+
+    def _restore_profile_to_tabs(self):
+        """重建后把已加载的档案重新喂给各页（不弹框，失败仅日志）"""
+        if self.profile_path and os.path.isfile(self.profile_path):
+            try:
+                data = load_profile(self.profile_path)
+            except ValueError as exc:
+                self.log(T("msg_warn_profile_start") % exc)
+                return
+            self.profile_data = data
+            self.export_tab.on_profile_loaded(self.profile_path, data)
+            self.clean_tab.on_profile_loaded(data)
+
+    # ---------------- StringVar 登记 ----------------
+
+    def v(self, name, default=""):
+        var = tk.StringVar(value=default)
+        self._vars[name] = var
+        return var
+
+    def _snapshot_vars(self):
+        return {k: vg.get() for k, vg in self._vars.items()}
+
+    def _restore_vars(self, vals):
+        for k, val in vals.items():
+            if k in self._vars:
+                self._vars[k].set(val)
+
+    # ---------------- 菜单栏 ----------------
+
+    def _build_menubar(self):
+        mb = tk.Menu(self)
+
+        m_file = tk.Menu(mb, tearoff=0)
+        m_file.add_command(label=T("file_open_outdir"), command=self._open_outdir)
+        m_file.add_command(label=T("file_open_cfgdir"), command=self._open_cfgdir)
+        m_file.add_separator()
+        m_file.add_command(label=T("file_exit"), command=self.destroy)
+        mb.add_cascade(label=T("menu_file"), menu=m_file)
+
+        m_sett = tk.Menu(mb, tearoff=0)
+        m_lang = tk.Menu(m_sett, tearoff=0)
+        zh_label = ("✓ " if get_lang() == LANG_ZH else "") + T("sett_lang_zh")
+        en_label = ("✓ " if get_lang() == LANG_EN else "") + T("sett_lang_en")
+        m_lang.add_command(label=zh_label, command=lambda: self.set_language(LANG_ZH))
+        m_lang.add_command(label=en_label, command=lambda: self.set_language(LANG_EN))
+        m_theme = tk.Menu(m_sett, tearoff=0)
+        _cur = current_theme_name() or self.cfg.get("theme") or DEFAULT_THEME
+        for _key, _label in list_themes():
+            _tick = "✓ " if _key == _cur else ""
+            m_theme.add_command(label=_tick + _label,
+                                command=lambda k=_key: self._set_theme(k))
+        m_sett.add_cascade(label="界面主题", menu=m_theme)
+        # v3.12.1：按钮风格切换（圆润/像素），持久化 cfg["button_style"]
+        m_bstyle = tk.Menu(m_sett, tearoff=0)
+        _bcur = current_button_style()
+        for _bkey, _blabel in list_button_styles():
+            _btick = "✓ " if _bkey == _bcur else ""
+            m_bstyle.add_command(label=_btick + _blabel,
+                                 command=lambda k=_bkey: self._set_button_style(k))
+        m_sett.add_cascade(label="按钮风格", menu=m_bstyle)
+        m_sett.add_cascade(label=T("sett_lang"), menu=m_lang)
+        m_sett.add_separator()
+        m_sett.add_command(label=T("sett_skills"), command=self._browse_skills_root)
+        m_sett.add_command(label=T("sett_outdir"), command=self._set_default_outdir)
+        mb.add_cascade(label=T("menu_settings"), menu=m_sett)
+
+        m_tools = tk.Menu(mb, tearoff=0)
+        m_tools.add_command(label=T("tools_open_skills"), command=self._open_skills_dir)
+        m_tools.add_command(label=T("tools_open_outdir"), command=self._open_outdir)
+        m_tools.add_command(label=T("tools_open_cfgdir"), command=self._open_cfgdir)
+        m_tools.add_separator()
+        m_tools.add_command(label=T("tools_clear_log"), command=self._clear_log)
+        m_tools.add_command(label=T("tools_export_diag"), command=self._export_diag_bundle)
+        mb.add_cascade(label=T("menu_tools"), menu=m_tools)
+
+        m_help = tk.Menu(mb, tearoff=0)
+        m_help.add_command(label=T("help_howto"), command=self._show_help)
+        m_help.add_command(label=T("help_about"), command=self._show_about)
+        mb.add_cascade(label=T("menu_help"), menu=m_help)
+
+        self.config(menu=mb)
+
+    def _open_outdir(self):
+        d = self.cfg.get("last_out_dir", "")
+        if not open_in_explorer(d):
+            messagebox.showinfo(T("menu_file"), T("no_outdir"))
+
+    def _open_cfgdir(self):
+        os.makedirs(APP_DIR, exist_ok=True)
+        os.startfile(APP_DIR)
+
+    def _open_skills_dir(self):
+        open_in_explorer(self.resolver.skills_root)
+
+    def _browse_skills_root(self):
+        chosen = filedialog.askdirectory(
+            title=T("choose_skills_title"),
+            initialdir=self.resolver.skills_root if os.path.isdir(self.resolver.skills_root) else None)
+        if not chosen:
+            return
+        self.cfg["skills_root"] = chosen
+        save_config(self.cfg)
+        self.resolver = PathResolver(chosen)
+        self._refresh_resolver_status()
+        self.log("[cfg] 技能目录 -> %s\n" % chosen)
+
+    def _set_default_outdir(self):
+        chosen = filedialog.askdirectory(
+            title=T("choose_outdir_title"),
+            initialdir=self.cfg.get("last_out_dir") or None)
+        if chosen:
+            self.cfg["last_out_dir"] = chosen
+            save_config(self.cfg)
+            self._restore_vars({"export_out": chosen})
+            self.log("[cfg] 默认输出目录 -> %s\n" % chosen)
+
+    # ---------------- 语言切换 ----------------
+
+    def set_language(self, lang):
+        if lang == get_lang():
+            return
+        self.cfg["lang"] = lang
+        save_config(self.cfg)
+        set_lang(lang)
+        self._rebuild_ui()
+        self.log(T("lang_changed"))
+
+    def _set_theme(self, name):
+        """S13：运行时切换界面主题，持久化到 cfg["theme"]。
+
+        v3.14.0 P0-1：切主题不换卡片类，走轻量 refresh 链（不销毁控件、
+        不丢输入）——卡片壳与头部横幅随新主题换色。
+        """
+        actual = set_theme(self, name)
+        self.cfg["theme"] = actual
+        save_config(self.cfg)
+        # 粒子背景同步换色
+        try:
+            if hasattr(self, "particle") and self.particle.winfo_exists():
+                self.particle.set_theme(actual)
+        except Exception:
+            pass
+        # v3.14.0 P0-1：卡片壳 + 头部横幅随主题换色
+        try:
+            refresh_cards(self)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "hero", None) is not None:
+                self.hero.refresh()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "style_seg", None) is not None:
+                self.style_seg.refresh()
+        except Exception:
+            pass
+        self.log("[theme] 界面主题 -> %s\n" % actual)
+
+    def _set_button_style(self, name):
+        """v3.12.1：运行时切换按钮风格，持久化 cfg["button_style"]。
+        v3.14.0 A1（裁决 14-6）：① 背景层随档案切动效（pixel=方块粒子/glass=水波纹）；
+        ② 扫描建档页卡片重建（PixelCard↔GlassCard 换壳）。
+        v3.14.0 P1-6：任务进行中被跳过的页不再静默——日志与状态栏明说稍后生效。"""
+        actual = set_button_style(self, name)
+        self.cfg["button_style"] = actual
+        save_config(self.cfg)
+        # 15-6b（第三次复盘 D3 收尾）：分段器选中态与实际档案同步——
+        # 此前 value 只在构建时取一次，运行时经菜单/程序切换后指示器停旧档
+        try:
+            if getattr(self, "style_seg", None) is not None:
+                self.style_seg.set(actual)
+        except Exception:
+            pass
+        # ① 背景动效分档
+        try:
+            if hasattr(self, "particle") and self.particle.winfo_exists():
+                self.particle.set_mode("glass" if actual == "glass" else "pixel")
+        except Exception:
+            pass
+        # ② 各页卡片随档案换壳（15-6b 修复：A1/A2 的「w / w.inner 两层检查」
+        #    摸不到宿主——装配结构是 tab = TabCls(wrap.inner, app)，Tab 实例
+        #    是 inner 的**子控件**，hasattr(inner, "rebuild_cards") 恒 False，
+        #    运行时切风格从未换过壳（实拍 state=pixel 下 9 卡全是 GlassCard 实锤）。
+        #    改为整树递归收集宿主再统一重建；异常不再静默——进日志留痕。）
+        skipped = []
+        hosts = []
+        _seen = set()
+
+        def _collect_hosts(w):
+            if id(w) in _seen:
+                return
+            _seen.add(id(w))
+            if hasattr(w, "rebuild_cards") and callable(getattr(w, "rebuild_cards")):
+                hosts.append(w)
+            try:
+                children = w.winfo_children()
+            except Exception:
+                children = []
+            for c in children:
+                _collect_hosts(c)
+
+        try:
+            for tab in self.nb.tabs():
+                _collect_hosts(self.nametowidget(tab))
+            for host in hosts:
+                try:
+                    if not host.rebuild_cards():
+                        skipped.append(getattr(host, "title", str(host)))
+                except Exception as exc:
+                    # 15-6b：换壳异常不再吞——日志留痕（73 号：静默失效最伤）
+                    try:
+                        self.log("[style] 换壳失败 %s: %r\n" % (type(host).__name__, exc))
+                    except Exception:
+                        pass
+        except Exception as exc:
+            try:
+                self.log("[style] 换壳遍历异常: %r\n" % (exc,))
+            except Exception:
+                pass
+        if skipped:
+            # v3.14.0 P1-6 衍生：set_button_style 内部 apply() 已全树重着色，
+            # 跳过 rebuild 的页面若不 refresh 兜底，卡片壳会停在乱刷残色
+            try:
+                refresh_cards(self)
+            except Exception:
+                pass
+            try:
+                self.log("[style] %s 任务进行中，风格 %s 将在任务结束后（或重启后）换壳\n"
+                         % ("、".join(skipped), actual))
+            except Exception:
+                pass
+        self.log("[style] 按钮风格 -> %s\n" % actual)
+
+    # ---------------- 日志 / 状态栏 ----------------
+
+    # S8（v3.8.0）：日志区默认折叠 —— 高度还给用户，日志点标题才展开。
+    # 旧写法日志块 fill=both+expand=True 常驻，抢走主区高度，小屏上四个页签
+    # 被压得只剩横滚。现在折叠态只占一行标题，主区全归 Notebook。
+    LOG_DEFAULT_HEIGHT = 9
+
+    def _log_height(self):
+        """展开行数（config.json::log_height，缺省 9，钳在 4~40）。"""
+        try:
+            v = int(self.cfg.get("log_height") or self.LOG_DEFAULT_HEIGHT)
+        except (TypeError, ValueError):
+            v = self.LOG_DEFAULT_HEIGHT
+        return max(4, min(40, v))
+
+    def _refresh_log_toggle(self):
+        arrow = "▾" if getattr(self, "_log_open", False) else "▸"
+        txt = "%s %s（%d 条）" % (arrow, T("log_section"), getattr(self, "log_count", 0))
+        # 折叠期间来新日志 → 标题挂「● 新」，不打断当前视线
+        if not getattr(self, "_log_open", False) and getattr(self, "_log_unread", False):
+            txt += "  ● " + T("log_new")
+        self.log_toggle_var.set(txt)
+
+    def toggle_log(self, open_it=None):
+        """展开 / 收起日志区（点标题切换；open_it 显式指定时不切换）。"""
+        self._log_open = (not self._log_open) if open_it is None else bool(open_it)
+        try:
+            if self._log_open:
+                self.log_body.pack(fill="both", expand=False, pady=(2, 0))
+                self.log_text.see("end")
+            else:
+                self.log_body.pack_forget()
+        except Exception:
+            pass
+        if self._log_open:
+            self._log_unread = False
+        self.cfg["log_open"] = self._log_open
+        save_config(self.cfg)
+        self._refresh_log_toggle()
+
+    def _on_log_height(self):
+        """展开高度改动 → 立刻生效 + 记进 config.json 下次沿用。"""
+        try:
+            v = int(self.log_height_var.get())
+        except (TypeError, ValueError):
+            return
+        v = max(4, min(40, v))
+        self.log_height_var.set(v)
+        try:
+            self.log_text.configure(height=v)
+        except Exception:
+            pass
+        self.cfg["log_height"] = v
+        save_config(self.cfg)
+
+    def _build_log(self):
+        wrap = ttk.Frame(self)
+        wrap.pack(fill="x", padx=8, pady=(4, 4))
+        self.log_wrap = wrap
+
+        # 标题行（常驻）：点一下展开/收起
+        head = ttk.Frame(wrap)
+        head.pack(fill="x")
+        self.log_toggle_var = tk.StringVar(value="")
+        self.log_toggle = ttk.Label(head, textvariable=self.log_toggle_var,
+                                    foreground="#2a6db0", cursor="hand2")
+        self.log_toggle.pack(side="left")
+        self.log_toggle.bind("<Button-1>", lambda e: self.toggle_log())
+        ttk.Label(head, text=T("log_hint"), foreground="#888").pack(side="right")
+        ttk.Label(head, text=T("log_lines")).pack(side="right", padx=(0, 6))
+        self.log_height_var = tk.IntVar(value=self._log_height())
+        self.log_height_spin = ttk.Spinbox(head, from_=4, to=40, width=4,
+                                           textvariable=self.log_height_var,
+                                           command=self._on_log_height)
+        self.log_height_spin.pack(side="right")
+
+        # 正文（默认收起）
+        body = ttk.Frame(wrap)
+        self.log_body = body
+        self.log_text = tk.Text(body, height=self._log_height(), wrap="word", undo=False,
+                                font=("Consolas", 9))
+        # P2（v1.5.0）：质检报告的着色 tag（红=异常 / 绿=通过）
+        self.log_text.tag_configure("err", foreground="#c00")
+        self.log_text.tag_configure("ok", foreground="#070")
+        sb = ttk.Scrollbar(body, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.log_text.pack(side="left", fill="both", expand=True)
+
+        # 按钮行常驻：中止按钮在折叠态也必须能点得到
+        btn_row = ttk.Frame(wrap)
+        btn_row.pack(fill="x", pady=(2, 0))
+        ttk.Button(btn_row, text=T("log_clear"), command=self._clear_log,
+                   width=16).pack(side="left")
+        # v1.3.0 卡死专项：中止按钮 + 运行时长 / 无输出看门狗读数
+        self.abort_btn = ttk.Button(btn_row, text=ICON_STOP+" "+T("log_abort"),
+                                    command=self._abort_worker, width=12,
+                                    style="Danger.TButton", state="disabled")
+        self.abort_btn.pack(side="left", padx=(8, 0))
+        self.run_time_var = tk.StringVar(value="")
+        ttk.Label(btn_row, textvariable=self.run_time_var,
+                  foreground="#c00").pack(side="left", padx=(8, 0))
+
+        # 初始态：默认折叠（config.json::log_open 为 true 才展开）
+        self.log_count = 0
+        self._log_unread = False
+        self._log_open = bool(self.cfg.get("log_open", False))
+        self._refresh_log_toggle()
+        if self._log_open:
+            body.pack(fill="both", expand=False, pady=(2, 0))
+
+    def _auto_enhance(self):
+        """v3.12.0：遍历全部 Treeview 加行 hover 高亮（鼠标交互增强）。"""
+        def walk(w):
+            try:
+                if isinstance(w, ttk.Treeview):
+                    attach_tree_hover(w)
+            except Exception:
+                pass
+            try:
+                for c in w.winfo_children():
+                    walk(c)
+            except Exception:
+                pass
+        walk(self)
+        auto_tooltip(self)
+
+    def _build_statusbar(self):
+        bar = ttk.Frame(self, padding=PAD_STATUSBAR)
+        bar.pack(fill="x")
+        self.status_ptsl_var = tk.StringVar(value="…")
+        self.status_sess_var = tk.StringVar(value=T("status_session") % "—")
+        self.status_prof_var = tk.StringVar(value=T("status_profile") % "—")
+        self.status_skills_var = tk.StringVar(value="…")
+        self.ptsl_led = StatusLED(bar, state="off", size=12)
+        self.ptsl_led.pack(side="left", padx=(0, PAD_SM))
+        ttk.Label(bar, textvariable=self.status_ptsl_var, font=FONT_SMALL).pack(side="left")
+        ttk.Label(bar, textvariable=self.status_sess_var,
+                  style="Small.TLabel").pack(side="left", padx=PAD_MD)
+        ttk.Label(bar, textvariable=self.status_prof_var,
+                  style="Small.TLabel").pack(side="left", padx=PAD_MD)
+        ttk.Label(bar, textvariable=self.status_skills_var,
+                  style="Small.TLabel").pack(side="right", padx=(0, 10))
+        Badge(bar, text="Pro", variant="accent").pack(side="right", padx=(0, 6))
+
+    # 日志滚动上限：批量几十集时 Text 行数是主线程卡顿的隐形来源
+    LOG_MAX_LINES = 5000
+
+    def log(self, text, tag=None):
+        """追加日志。tag="err"/"ok" 时按 _build_log 里配置的颜色渲染（P2）。"""
+        if not getattr(self, "log_text", None):
+            return
+        if tag:
+            self.log_text.insert("end", text, tag)
+        else:
+            self.log_text.insert("end", text)
+        self.log_text.see("end")
+        self._trim_log()
+        # S8：计数 + 折叠态角标（不打断当前视线，只动标题行）
+        self.log_count = getattr(self, "log_count", 0) + 1
+        if not getattr(self, "_log_open", True):
+            self._log_unread = True
+        if getattr(self, "log_toggle_var", None) is not None:
+            self._refresh_log_toggle()
+
+    def _trim_log(self):
+        try:
+            n = int(self.log_text.index("end-1c").split(".")[0])
+            if n > self.LOG_MAX_LINES:
+                self.log_text.delete("1.0", "%d.0" % (n - self.LOG_MAX_LINES + 1))
+        except Exception:
+            pass
+
+    def _clear_log(self):
+        if getattr(self, "log_text", None):
+            self.log_text.delete("1.0", "end")
+        self.log_count = 0
+        self._log_unread = False
+        if getattr(self, "log_toggle_var", None) is not None:
+            self._refresh_log_toggle()
+
+    def _export_diag_bundle(self):
+        """工具 → 导出诊断包：调 worker.build_diag_bundle 打包日志+配置+版本号。
+
+        产物落在 APP_DIR（%APPDATA%\\pt-tools\\）下，弹托盘通知给出路径。
+        App 本身即 Tk 根窗口，toast 的第一个参数传 self（曾误写 App.win → AttributeError）。
+        """
+        import os
+        from ptools.core.i18n import T
+        from ptools.core.settings import APP_DIR, APP_VERSION, build_date
+        from ptools.core.notify import toast
+        from ptools.worker.runner import build_diag_bundle
+        fname = "pt-tools-diag-%s-%s.zip" % (APP_VERSION, build_date())
+        out = os.path.join(APP_DIR, fname)
+        try:
+            path, n = build_diag_bundle(out)
+            toast(self, T("toast_title"), T("msg_diag_exported") % path)
+        except Exception as e:
+            toast(self, T("toast_title"), T("msg_diag_failed") % e)
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.out_queue.get_nowait()
+                if kind == "line":
+                    self.log(payload if payload.endswith("\n") else payload + "\n")
+                elif kind == "tick":
+                    pass          # 心跳：worker 内部已更新 _last_out
+                elif kind == "stall":
+                    self.log(T("log_stalled") % payload)
+                elif kind == "done":
+                    self._on_worker_done(payload)
+        except queue.Empty:
+            pass
+        self._update_run_clock()
+        self.after(100, self._poll_queue)
+
+    def _update_run_clock(self):
+        """运行时长 + 距上次输出秒数（无输出 ≥30s 才显示，避免刷屏）。"""
+        w = self.active_worker
+        if w is None or not w.is_alive():
+            if self.run_time_var.get():
+                self.run_time_var.set("")
+            return
+        el = int(time.time() - w.started_at)
+        txt = T("log_running") % (el // 60, el % 60)
+        gap = int(time.time() - w._last_out)
+        if gap >= 30:
+            txt += " · " + (T("log_no_output") % gap)
+        self.run_time_var.set(txt)
+
+    def _abort_worker(self):
+        """「■ 中止」按钮 —— 真正能停（旧版 cancelled 标志全仓无人置 True）。"""
+        w = self.active_worker
+        if w is None:
+            return
+        if not messagebox.askyesno(T("abort_title"), T("abort_confirm")):
+            return
+        self.log(T("log_aborting"))
+        w.cancel()
+
+    def _on_worker_done(self, returncode):
+        self.active_worker = None
+        if getattr(self, "abort_btn", None):
+            self.abort_btn.configure(state="disabled")
+        self.scan_tab.on_worker_done(returncode)
+        self.export_tab.on_worker_done(returncode)
+        self._refresh_gating()
+        if self.logger is not None:
+            self.logger.info("命令队列结束，退出码=%s", returncode)
+        if returncode == -1:
+            self.log(T("cmd_aborted"))
+            toast(self, T("toast_title"), T("toast_aborted"))
+        else:
+            self.log(T("cmd_done") % returncode)
+            # W7：长任务跑完弹通知，人切去干别的也能被叫回来
+            toast(self, T("toast_title"), T("toast_done") % returncode)
+
+    def start_worker(self, cmds):
+        """启动后台命令队列。cmds 可为单条命令（list[str]）或命令列表。"""
+        if cmds and isinstance(cmds[0], str):
+            cmds = [cmds]
+        for cmd in cmds:
+            self.log("> %s\n" % " ".join('"%s"' % c if " " in c else c for c in cmd))
+        if self.logger is not None:
+            self.logger.info(
+                "启动命令队列（%d 条）：%s",
+                len(cmds),
+                " | ".join(" ".join(c) for c in cmds))
+        self.workers = [x for x in self.workers if x.is_alive()]   # 只留活着的
+        w = CmdWorker(cmds, self.out_queue)
+        self.workers.append(w)
+        self.active_worker = w
+        if getattr(self, "abort_btn", None):
+            self.abort_btn.configure(state="normal")
+        w.start()
+        return w
+
+    def _on_close(self):
+        """点 X 一定关得掉（Q12）。
+
+        旧行为：destroy 之后主线程试图退出，却被 subprocess 的 atexit 钩子挂住
+        —— 它在等仍存活的子进程 —— 于是表现为"点关闭没反应，只能从任务管理器杀"。
+        现在：有活任务先问一句，确认后终止本工具自己 spawn 的子进程树，再退出。
+        ⚠️ 只杀 self.workers 里的子进程，绝不碰 ProTools.exe。
+        """
+        running = [w for w in self.workers if w.is_alive()]
+        if running:
+            if not messagebox.askyesno(T("quit_title"), T("quit_confirm")):
+                return
+            for w in running:
+                try:
+                    w.cancel()
+                except Exception:
+                    pass
+            for w in running:
+                w.join(timeout=3)
+        # S12：关窗前把当前尺寸写回 cfg，下次启动原样恢复
+        try:
+            self.cfg["window"] = window_size(self)
+            save_config(self.cfg)
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        # os._exit 跳过 atexit 的 subprocess 等待，保证进程一定退出
+        os._exit(0)
+
+    # ---------------- 状态 ----------------
+
+    def _poll_ptsl(self):
+        on = ptsl_online()
+        self.ptsl_on = on
+        self.status_ptsl_var.set(T("status_ptsl_on") if on else T("status_ptsl_off"))
+        if getattr(self, "ptsl_led", None):
+            self.ptsl_led.set_state("ok" if on else "err")
+        # P1：离线黄条随探测结果收放
+        if on:
+            self._hide_warn_bar()
+        else:
+            self._show_warn_bar()
+        self.scan_tab.set_ptsl(on)
+        self._refresh_gating()
+        self.after(5000, self._poll_ptsl)
+
+    def _refresh_gating(self):
+        self.scan_tab.refresh_buttons()
+        self.export_tab.refresh_buttons()
+
+    def _refresh_resolver_status(self):
+        ok, _msg = self.resolver.status()
+        self.status_skills_var.set(T("status_skills_ok") if ok
+                                   else T("status_skills_bad"))
+        if not ok:
+            self.log("[warn] " + _msg + "\n")
+
+    # ---------------- profile 共享 ----------------
+
+    def apply_profile(self, path):
+        """扫描完成后：应用档案到全局与各页"""
+        try:
+            data = load_profile(path)
+        except ValueError as exc:
+            messagebox.showerror(T("msg_profile_invalid"), str(exc))
+            return False
+        self.profile_path = path
+        self.profile_data = data
+        self.cfg["last_profile"] = path
+        save_config(self.cfg)
+        sess = data["session"]
+        self.status_sess_var.set(T("status_session") % sess.get("name", "?"))
+        self.status_prof_var.set(T("status_profile") % path)
+        self.export_tab.on_profile_loaded(path, data)
+        self.clean_tab.on_profile_loaded(data)
+        return True
+
+    def _try_load_profile(self, path):
+        try:
+            data = load_profile(path)
+        except ValueError as exc:
+            self.log(T("msg_warn_profile_start") % exc)
+            return
+        self.profile_data = data
+        sess = data["session"]
+        self.status_sess_var.set(T("status_session") % sess.get("name", "?"))
+        self.status_prof_var.set(T("status_profile") % path)
+        self.export_tab.on_profile_loaded(path, data)
+        self.clean_tab.on_profile_loaded(data)
+
+    # ---------------- 帮助 / 关于 ----------------
+
+    def _show_help(self):
+        win = tk.Toplevel(self)
+        win.title(T("help_howto"))
+        win.transient(self)
+        win.geometry("560x430")
+        t = tk.Text(win, wrap="word", padx=12, pady=12, font=("Microsoft YaHei UI", 10))
+        t.insert("1.0", T("help_text"))
+        t.configure(state="disabled")
+        t.pack(fill="both", expand=True)
+        center_on_parent(win, self)
+
+    def _show_about(self):
+        win = tk.Toplevel(self)
+        win.title(T("help_about"))
+        win.transient(self)
+        win.geometry("460x260")
+        t = tk.Text(win, wrap="word", padx=12, pady=12, font=("Microsoft YaHei UI", 10))
+        t.insert("1.0", T("about_text"))
+        t.configure(state="disabled")
+        t.pack(fill="both", expand=True)
+        center_on_parent(win, self)
+
+
+# ---------------------------------------------------------------------------
+# Tab 1 · 扫描建档
+# ---------------------------------------------------------------------------
+
+def make_banner(parent, text, kind="warn"):
+    """窄警示条（v3.14.0 A2，31 号 §三「警示条融入版式」）：左 4px 竖色条 +
+    淡底 + ⚠ 一行字，高度约为旧满宽大块的一半。PT 离线黄条 / 清理页红条
+    共用本函数（单一真源），配色深浅两档。"""
+    pal = get_colors()
+    try:
+        from ptools.gui.widgets import _pal_dark
+        dark = _pal_dark(pal)
+    except Exception:
+        dark = False
+    if kind == "danger":
+        bar, bg, fg = (("#e07b6f", "#3a2422", "#f2c4bf") if dark
+                       else ("#c0392b", "#fdecea", "#7a1f18"))
+    else:  # warn
+        bar, bg, fg = (("#e8c268", "#3a3421", "#f0e2b0") if dark
+                       else ("#e0a800", "#fff7dd", "#5a4a00"))
+    b = tk.Frame(parent, bg=bg, highlightthickness=1,
+                 highlightbackground=bar)
+    tk.Frame(b, width=4, bg=bar).pack(side="left", fill="y")
+    tk.Label(b, text="⚠", bg=bg, fg=bar).pack(side="left", padx=(6, 2))
+    tk.Label(b, text=text, bg=bg, fg=fg, anchor="w", justify="left",
+             font=FONT_SMALL, padx=2, pady=3,
+             wraplength=820).pack(side="left", fill="x", expand=True)
+    return b
+
+
+class ScanTab(ttk.Frame):
+    # v3.14.0 A1（裁决 14-6）：全量布局重排打样 ——
+    #   旧版单列从上堆到下（两段长说明占 ~1/3 屏、功能零卡片、LabelFrame 老框线）；
+    #   新版六分区语言：扫描设置/生成交付包 两卡并列（PixelCard|GlassCard 随风格档案换壳）、
+    #   长说明+前置要求收进折叠条（默认一行）、摘要做成实心日志卡。
+    #   头部（HeroHeader）/页签行/状态条不在本页范围（已落/主窗已有）。
+    def __init__(self, master, app):
+        super().__init__(master, padding=PAD_LG)
+        self.app = app
+        self.busy = False
+        self.last_profile_path = ""
+        self._build()
+
+    def _build(self):
+        app = self.app   # v3.14.0 A1 修复：_build 从 __init__ 拆出后需自取 app 引用
+        # 重建入口（风格切换 rebuild_cards 调用）：先清场
+        for w in self.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        pal = get_colors()
+        bg = pal["BG"]
+        card_cls = GlassCard if current_button_style() == "glass" else PixelCard
+
+        # —— 主功能区：两列卡片（扫描设置 | 生成交付包）——
+        top = tk.Frame(self, bg=bg)
+        top.pack(fill="x")
+        scan_card = card_cls(top, title=T("s_card_scan"))
+        scan_card.pack(side="left", fill="both", expand=True)
+        deliv_card = card_cls(top, title=T("d_run"))
+        deliv_card.pack(side="left", fill="both", expand=True, padx=(PAD_MD, 0))
+        self._scan_card, self._deliv_card = scan_card, deliv_card
+
+        # 左卡：输出目录 / 档案名 / 主按钮（本页唯一赤陶）
+        body = scan_card.body
+        # v1.4.0：建档输出默认走 profile_dir（Backup-PT-Tools/json），
+        # 不与导出输出共用 last_out_dir —— 两个落点语义不同，混用一个值会互相带偏。
+        row = tk.Frame(body, bg=pal["SURFACE"])
+        row.pack(fill="x", padx=10, pady=(8, 6))
+        tk.Label(row, text=T("s_out"), bg=pal["SURFACE"], fg=pal["FG"]).pack(side="left")
+        self.out_var = app.v("scan_out",
+                             app.cfg.get("profile_dir") or app.cfg.get("last_out_dir", ""))
+        # S8（v3.8.0）：路径框不写死宽度 —— 宽窗撑满、窄窗自动收窄。
+        ttk.Entry(row, textvariable=self.out_var, width=1).pack(
+            side="left", fill="x", expand=True, padx=6)
+        ttk.Button(row, text=T("s_browse"), command=self._browse_out,
+                   width=10).pack(side="left")
+
+        row2 = tk.Frame(body, bg=pal["SURFACE"])
+        row2.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(row2, text=T("s_name"), bg=pal["SURFACE"],
+                 fg=pal["FG"]).pack(side="left")
+        self.name_var = app.v("scan_name", "pt-profile.json")
+        ttk.Entry(row2, textvariable=self.name_var, width=24).pack(side="left", padx=6)
+        self.scan_btn = PixelButton(row2, text=T("s_scan_btn"), icon="search",
+                                    command=self.do_scan, primary=True)
+        self.scan_btn.pack(side="right", padx=(6, 0))
+
+        # 右卡：交付包说明 / 交付路径 / 次级按钮
+        dbody = deliv_card.body
+        ttk.Label(dbody, text=T("d_what"), wraplength=380, justify="left",
+                  style="Dim.TLabel").pack(anchor="w", padx=10, pady=(8, 4))
+        drow = tk.Frame(dbody, bg=pal["SURFACE"])
+        drow.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(drow, text=T("d_pkg_out"), bg=pal["SURFACE"],
+                 fg=pal["FG"]).pack(side="left")
+        # 交付包落点：出厂默认 DEFAULT_DELIVERY_ROOT（Backup-Deliver\PT-Tools），
+        # 不从 last_out_dir 派生；用户改过就以 config 的 delivery_out 为准。
+        self.deliv_var = app.v("delivery_out", DEFAULT_DELIVERY_ROOT)
+        ttk.Entry(drow, textvariable=self.deliv_var, width=1).pack(
+            side="left", fill="x", expand=True, padx=6)
+        ttk.Button(drow, text=T("s_browse"), width=10,
+                   command=self._browse_deliv).pack(side="left")
+        drow2 = tk.Frame(dbody, bg=pal["SURFACE"])
+        drow2.pack(fill="x", padx=10, pady=(0, 8))
+        # v3.13.0 C1（裁决 13-4）：主按钮唯一赤陶 —— 交付包是次级动作。
+        self.deliv_btn = PixelButton(drow2, text=T("d_run"), icon="download",
+                                     command=self.do_delivery)
+        self.deliv_btn.pack(side="right")
+        # v3.14.0 A1 修复：tk.Label 无 style 选项 —— 说明行走 ttk（Dim.TLabel）
+        ttk.Label(drow2, text=T("d_note"), wraplength=260, justify="left",
+                  style="Dim.TLabel").pack(side="left", padx=(0, 8))
+
+        # —— 辅助说明区：长说明+前置要求+步骤 收进折叠条（默认只占一行）——
+        more = CollapsibleFrame(self, title=T("s_card_more"), open=False)
+        more.pack(fill="x", pady=(PAD_MD, 0))
+        mb = more.body
+        ttk.Label(mb, text=T("s_what_body"), wraplength=760,
+                  justify="left").pack(anchor="w", pady=(2, 6))
+        self.ptsl_label = ttk.Label(mb, text=T("s_req_ptsl_off"))
+        self.ptsl_label.pack(anchor="w")
+        ttk.Label(mb, text=T("s_req_line2"), style="Dim.TLabel").pack(
+            anchor="w", pady=(2, 6))
+        ttk.Label(mb, text=T("s_step1")).pack(anchor="w")
+        ttk.Label(mb, text=T("s_step2"), style="Dim.TLabel").pack(anchor="w")
+        ttk.Label(mb, text=T("s_step3"), style="Dim.TLabel").pack(
+            anchor="w", pady=(0, 6))
+
+        # —— 日志区：扫描摘要（恒实心卡，占余高）——
+        summ = card_cls(self, title=T("s_summary"))
+        summ.pack(fill="both", expand=True, pady=(PAD_MD, 0))
+        sbody = summ.body
+        self.summary_text = tk.Text(sbody, height=10, wrap="word",
+                                    font=("Consolas", 9), state="disabled",
+                                    bg=pal["SURFACE"], fg=pal["FG"],
+                                    relief="flat", bd=0,
+                                    selectbackground=pal["SELECT_BG"])
+        sb = ttk.Scrollbar(sbody, command=self.summary_text.yview)
+        self.summary_text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.summary_text.pack(side="left", fill="both", expand=True)
+        # v3.14.0 P0-C2：空态引导（扫描摘要写入为 delete+insert，自然覆盖）
+        self.summary_text.tag_configure("hint", foreground="#9a9a9a")
+        self.summary_text.configure(state="normal")
+        self.summary_text.insert(
+            "1.0", "（空）点「扫描并生成档案」后，此处显示工程摘要：\n"
+                   "会话名 · 轨道数 · 音频块统计 · 导出模式建议。", "hint")
+        self.summary_text.configure(state="disabled")
+
+    def rebuild_cards(self):
+        """风格档案切换（pixel↔glass）时换壳重建（_set_button_style 调用）。
+
+        v3.14.0 P1-5/P1-6：① 执行中（busy）不重建——当场重建丢输入、
+        按钮态错乱；② 重建前快照界面变量、重建后回填（app.v() 工厂每调
+        必新建 StringVar，不回填会把用户输入静默重置）。
+        返回 True=已重建；False=busy 跳过。
+        """
+        if getattr(self, "busy", False):
+            return False
+        snap = self.app._snapshot_vars()
+        self._build()
+        self.app._restore_vars(snap)
+        self.refresh_buttons()
+        return True
+
+    def _browse_out(self):
+        chosen = filedialog.askdirectory(
+            title=T("choose_outdir_title"),
+            initialdir=self.out_var.get() or None)
+        if chosen:
+            self.out_var.set(chosen)
+            # 建档目录单独记忆（profile_dir），不与导出输出（last_out_dir）混用
+            self.app.cfg["profile_dir"] = chosen
+            save_config(self.app.cfg)
+
+    def set_ptsl(self, on):
+        if not getattr(self, "ptsl_label", None):
+            return
+        text = T("s_req_ptsl_on") if on else T("s_req_ptsl_off")
+        color = "#0a0" if on else "#b00"
+        self.ptsl_label.configure(text=text, foreground=color)
+
+    def refresh_buttons(self):
+        # v3.14.0 A1：扫描/交付按钮 = PixelButton（自绘），禁用走 set_enabled
+        self.scan_btn.set_enabled(not (self.busy or not self.app.ptsl_on))
+        self.deliv_btn.set_enabled(not self.busy)
+
+    def do_scan(self):
+        out = self.out_var.get().strip()
+        name = self.name_var.get().strip()
+        if not out:
+            messagebox.showerror(T("msg_missing"), T("s_missing_out"))
+            return
+        if not name.endswith(".json"):
+            messagebox.showerror(T("msg_invalid"), T("s_bad_name"))
+            return
+        # v1.4.0：建档目录不存在就现建，别等扫描器写文件时才报错
+        try:
+            os.makedirs(out, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror(T("msg_invalid"), str(exc))
+            return
+        cmd = [self.app.resolver.venv_python,
+               self.app.resolver.script("pt-scanner"),
+               "--out", out, "--name", name]
+        self.busy = True
+        self._mode = "scan"
+        self.refresh_buttons()
+        self.app.start_worker(cmd)
+
+    def _browse_deliv(self):
+        chosen = filedialog.askdirectory(title=T("choose_outdir_title"),
+                                         initialdir=self.deliv_var.get() or None)
+        if chosen:
+            self.deliv_var.set(chosen)
+
+    def do_delivery(self):
+        """P1（v2.7.0 / C批）：交付包一步直出 —— 调 pt-clips 技能（扫描+打包）。"""
+        if self.busy:
+            return
+        if not self.app.ptsl_on:
+            messagebox.showerror(T("msg_invalid"), T("d_need_ptsl"))
+            return
+        pkg_dir = self.deliv_var.get().strip()
+        if not pkg_dir:
+            messagebox.showerror(T("msg_invalid"), T("d_missing_out"))
+            return
+        try:
+            os.makedirs(pkg_dir, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror(T("msg_invalid"), str(exc))
+            return
+        json_dir = os.path.join(pkg_dir, "_json")
+        cmd = [self.app.resolver.venv_python,
+               self.app.resolver.script("pt-clips"),
+               "--json-dir", json_dir, "--pkg-dir", pkg_dir]
+        self.busy = True
+        self._mode = "delivery"
+        self.refresh_buttons()
+        try:
+            self.deliv_btn.configure(state="disabled", text=T("d_running"))
+        except Exception:
+            pass
+        self.app.start_worker(cmd)
+
+    def on_worker_done(self, returncode):
+        if not self.busy:
+            return
+        self.busy = False
+        self.refresh_buttons()
+        # P1：交付包与扫描共用 worker 通道，按 _mode 分流收尾
+        if getattr(self, "_mode", "scan") == "delivery":
+            try:
+                self.deliv_btn.configure(state="normal", text=ICON_PLAY+" "+T("d_run"))
+            except Exception:
+                pass
+            if returncode == 0:
+                self.app.log(T("d_done") % self.deliv_var.get().strip() + "\n")
+            else:
+                self.app.log(T("d_fail") + "\n")
+            return
+        if returncode == 0:
+            out = self.out_var.get().strip()
+            path = os.path.join(out, self.name_var.get().strip())
+            # v1.4.0：平铺档案按工程名自动命名（用户拍板方案 B）
+            path = self._rename_by_session(out, path)
+            self.last_profile_path = path
+            self._show_summary(path)
+            if self.app.apply_profile(path):
+                self.app.log(T("s_auto_applied") % path)
+            # P3：档案库列表同步刷新（新档案立即可见）
+            lt = getattr(self.app, "library_tab", None)
+            if lt is not None:
+                try:
+                    lt.refresh()
+                except Exception:
+                    pass
+        self.refresh_buttons()
+
+    def _rename_by_session(self, out_dir, path):
+        """v1.4.0：扫描完成后把档案改名成 `<工程名>-pt-profile.json`。
+
+        档案存放方式（2026-09-24 拍板）：**平铺 + 文件名区分**，不建
+        per-project 文件夹 —— pt-profile.json 是自包含单文件，平铺后
+        「浏览档案」一眼看全所有工程，按名排序即按工程分组。
+        工程名取自扫描结果 session.name（非法文件名字符清洗为下划线）；
+        同名重扫直接覆盖（同一工程刷新档案）；改名失败不阻断流程，
+        保留原文件名照常加载。
+        """
+        try:
+            data = load_profile(path)
+            name = ((data.get("session") or {}).get("name") or "").strip()
+        except Exception:
+            return path
+        if not name:
+            return path
+        safe = re.sub(r'[\\/:*?"<>|]+', "_", name).strip(" .") or "pt-profile"
+        target = os.path.join(out_dir, "%s-pt-profile.json" % safe)
+        try:
+            if os.path.abspath(target) != os.path.abspath(path):
+                if os.path.exists(target):
+                    os.remove(target)
+                os.rename(path, target)
+            self.name_var.set(os.path.basename(target))
+            return target
+        except OSError:
+            return path
+
+    def _show_summary(self, path):
+        try:
+            data = load_profile(path)
+        except ValueError as exc:
+            self._set_summary(T("sum_err") % exc)
+            return
+        sess = data["session"]
+        src = data["sources"]
+        lines = [
+            "%s: %s" % (T("sum_session"), sess.get("name", "?")),
+            "%s: %s" % (T("sum_path"), sess.get("path", "?")),
+            T("sum_rate") % (sess.get("sample_rate"), sess.get("bit_depth"),
+                             sess.get("timecode_rate")),
+            T("sum_range") % (sess.get("start_time"), sess.get("length")),
+            "%s: %d" % (T("sum_tracks"), len(data.get("tracks", []))),
+            "%s: %s" % (T("sum_bus"), ", ".join(src.get("bus", []))),
+            "%s: %s" % (T("sum_output"), ", ".join(src.get("output", []))),
+            "%s: %s" % (T("sum_phys"), ", ".join(src.get("physicalout", []))),
+        ]
+        self._set_summary("\n".join(lines) + "\n")
+
+    def _set_summary(self, text):
+        self.summary_text.configure(state="normal")
+        self.summary_text.delete("1.0", "end")
+        self.summary_text.insert("1.0", text)
+        self.summary_text.configure(state="disabled")
+
+
+# ---------------------------------------------------------------------------
+# Tab 2 · 导出
+# ---------------------------------------------------------------------------
+
+class ExportTab(ttk.Frame):
+    def __init__(self, master, app):
+        super().__init__(master, padding=PAD_LG)
+        self.app = app
+        self.busy = False
+        self.preview_ok = False
+        self._profile_path = ""
+        self._profile = None
+        self._preview_signature = ""
+        # P2（v1.5.0）：导出质检 —— 只有真导出（非预演）才触发，
+        # _qc_since 记录导出发起时刻，质检只看 mtime ≥ 它的产物。
+        self._last_was_export = False
+        self._qc_since = 0.0
+        self._build()
+
+    def _build(self):
+        """v3.14.0 A2：卡片化重排（扫描页同款语言）——档案与模式 / 轨道选择
+        （主体）/ 参数 三卡 + PixelButton 执行行；控件引用名全部保留，
+        逻辑方法零改动；rebuild_cards 风格切换换壳重建。"""
+        app = self.app
+        for w in self.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        pal = get_colors()
+        bg = pal["BG"]
+        card_cls = GlassCard if current_button_style() == "glass" else PixelCard
+
+        # —— 卡 1：档案与模式 ——
+        c1 = card_cls(self, title=T("e_card_profile"))
+        c1.pack(fill="x")
+        body1 = c1.body
+        row = tk.Frame(body1, bg=pal["SURFACE"])
+        row.pack(fill="x", padx=10, pady=(8, 4))
+        tk.Label(row, text=T("e_profile"), bg=pal["SURFACE"],
+                 fg=pal["FG"]).pack(side="left")
+        self.profile_var = app.v("export_profile", app.profile_path)
+        self.entry_profile = ttk.Entry(row, textvariable=self.profile_var, width=1)
+        self.entry_profile.pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(row, text=T("e_browse"),
+                   command=self._browse_profile).pack(side="left")
+
+        # -- 导出模式（v1.1.0 四模式多选：勾哪几个就按顺序导哪几路）
+        row2 = tk.Frame(body1, bg=pal["SURFACE"])
+        row2.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(row2, text=T("e_mode"), bg=pal["SURFACE"],
+                 fg=pal["FG"]).pack(side="left")
+        # 勾选用 StringVar("1"/"0")：走 App._vars 快照，语言切换整窗重建不丢状态
+        self.mode_mix_var = app.v("mode_mix", "1")
+        self.mode_stem_var = app.v("mode_stem", "1")
+        self.stem_aux_var = app.v("stem_aux", "0")
+        self.mode_bus_var = app.v("mode_bus", "0")
+        self.mode_track_var = app.v("mode_track", "0")
+        self.cb_mix = ttk.Checkbutton(row2, text=T("e_mode_mix"),
+                                      variable=self.mode_mix_var,
+                                      onvalue="1", offvalue="0")
+        self.cb_stem = ttk.Checkbutton(row2, text=T("e_mode_stem"),
+                                       variable=self.mode_stem_var,
+                                       onvalue="1", offvalue="0")
+        self.cb_stem_aux = ttk.Checkbutton(row2, text=T("e_mode_stem_aux"),
+                                           variable=self.stem_aux_var,
+                                           onvalue="1", offvalue="0")
+        self.cb_bus = ttk.Checkbutton(row2, text=T("e_mode_bus"),
+                                      variable=self.mode_bus_var,
+                                      onvalue="1", offvalue="0")
+        self.cb_track = ttk.Checkbutton(row2, text=T("e_mode_track"),
+                                        variable=self.mode_track_var,
+                                        onvalue="1", offvalue="0")
+        for _w in (self.cb_mix, self.cb_stem, self.cb_stem_aux,
+                   self.cb_bus, self.cb_track):
+            _w.pack(side="left", padx=3)
+
+        # —— 卡 2：轨道选择（高度=内容自适应 6 行；不 expand——v3.14.0 A2 实拍
+        # 修正：expand 会把参数卡+执行行挤出首屏，导出主按钮必须常驻可见）——
+        c2 = card_cls(self, title=T("e_track_frame_v2"))
+        c2.pack(fill="x", pady=(PAD_MD, 0))
+        src = c2.body
+
+        # -- 工程（v3.12.0：可折叠面板；A2 收进轨道卡顶部，默认收起）
+        sess_cf = CollapsibleFrame(src, title=T("e_session"), open=False)
+        sess_cf.pack(fill="x", padx=10, pady=(8, 4))
+        row2b = tk.Frame(sess_cf.body, bg=pal["SURFACE"])
+        row2b.pack(fill="x", padx=PAD_SM, pady=(PAD_SM, PAD_SM))
+        self.sess_mode_var = app.v("sess_mode", "current")
+        ttk.Radiobutton(row2b, text=T("e_sess_current"), value="current",
+                        variable=self.sess_mode_var,
+                        command=self._on_sess_mode_change).pack(side="left")
+        ttk.Radiobutton(row2b, text=T("e_sess_file"), value="file",
+                        variable=self.sess_mode_var,
+                        command=self._on_sess_mode_change).pack(side="left")
+        self.session_var = app.v("session_file", "")
+        ttk.Entry(row2b, textvariable=self.session_var, width=1,
+                  state="readonly").pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(row2b, text=T("e_browse"),
+                   command=self._browse_session).pack(side="left")
+
+        # -- 轨道列表（v1.2.0 勾选式选轨：STEM /「按轨道名称」共用；
+        #    空轨与排除名单默认不勾，全选/全不选一键切换）
+        #    （A2：原 LabelFrame 框线退役，容器=轨道卡 body）
+        xrow = tk.Frame(src, bg=pal["SURFACE"])
+        xrow.pack(fill="x", padx=10)
+        ttk.Label(xrow, text=T("e_exclude"),
+                  foreground="#555").pack(side="left")
+        self.exclude_var = app.v("track_exclude",
+                                 app.cfg.get("track_exclude", ""))
+        ttk.Entry(xrow, textvariable=self.exclude_var).pack(
+            side="left", fill="x", expand=True, padx=6)
+        self.exclude_var.trace_add("write", self._on_exclude_changed)
+        ttk.Button(xrow, text=T("e_select_all"), width=9,
+                   command=lambda: self._set_all_tracks(True)).pack(side="left", padx=2)
+        ttk.Button(xrow, text=T("e_deselect_all"), width=9,
+                   command=lambda: self._set_all_tracks(False)).pack(side="left", padx=2)
+
+        # 搜索行
+        srow = tk.Frame(src, bg=pal["SURFACE"])
+        srow.pack(fill="x", padx=10)
+        ttk.Label(srow, text=T("e_search") + " ",
+                  foreground="#555").pack(side="left")
+        self.search_var = app.v("src_search", "")
+        ttk.Entry(srow, textvariable=self.search_var, width=18).pack(side="left", padx=6)
+        self.search_var.trace_add("write", lambda *a: self._reload_sources())
+        self.src_count_var = tk.StringVar(value=T("e_selected") % 0)
+        ttk.Label(srow, textvariable=self.src_count_var,
+                  foreground="#555").pack(side="right")
+
+        # 列：选(☑/☐) / 名称 / 类型 / 音频块 / 声道（v1.3.0 每条轨道可单独指定）
+        self.src_tree = ttk.Treeview(
+            src, columns=("sel", "name", "type", "clips", "fmt"),
+            show="headings", selectmode="none", height=4)
+        self.src_tree.heading("sel", text=T("e_sel_col"))
+        self.src_tree.heading("name", text=T("e_name_col"))
+        self.src_tree.heading("type", text=T("e_type_col"))
+        self.src_tree.heading("clips", text=T("e_clips_col"))
+        self.src_tree.heading("fmt", text=T("e_fmt_col"))
+        self.src_tree.column("sel", width=44, anchor="center", stretch=False)
+        self.src_tree.column("name", width=250)
+        self.src_tree.column("type", width=70, anchor="center", stretch=False)
+        self.src_tree.column("clips", width=50, anchor="center", stretch=False)
+        self.src_tree.column("fmt", width=150, anchor="center", stretch=False)
+        tree_wrap = tk.Frame(src, bg=pal["SURFACE"])
+        tree_wrap.pack(fill="x", padx=10, pady=(4, 0))
+        sb = ttk.Scrollbar(tree_wrap, command=self.src_tree.yview)
+        self.src_tree.configure(yscrollcommand=sb.set)
+        self.src_tree.pack(in_=tree_wrap, side="left", fill="both", expand=True)
+        sb.pack(in_=tree_wrap, side="left", fill="y")
+        self.src_tree.bind("<Button-1>", self._on_track_click)
+        # S11：列宽按权重自适应（权重缺省按上面初始列宽比例，窗口缩放不出横条）
+        fit_tree_columns(self.src_tree,
+                         min_widths={"sel": 40, "name": 140, "type": 48,
+                                     "clips": 40, "fmt": 60})
+        # 勾选集合（轨道名）与排除名单解析缓存
+        self.track_checked = set()
+        self._exclude_pats = []
+        # v1.3.0：每条轨道的格式覆盖（轨名 -> 内部 key；空串/缺失 = 跟随全局）
+        self.track_fmt = {}
+        # v1.3.0：被剔除的空轨里，用户显式「加回（撤回）」的那些 —— 不再被剔除
+        self.track_restored = set()
+        self._reparse_exclude()
+
+        ttk.Label(src, text=T("e_fmt_hint"), style="Dim.TLabel",
+                  wraplength=720, justify="left").pack(fill="x", padx=10,
+                                                       pady=(2, 8))
+
+        # —— 卡 3：参数（时间 / 格式 / 输出）——
+        c3 = card_cls(self, title=T("e_params"))
+        c3.pack(fill="x", pady=(PAD_MD, 0))
+        opt = c3.body
+        opt.columnconfigure(1, weight=3)
+        opt.columnconfigure(3, weight=1)
+        ttk.Label(opt, text=T("e_start")).grid(row=0, column=0, sticky="w")
+        self.start_var = app.v("start", "00:00:00:00")
+        ttk.Entry(opt, textvariable=self.start_var, width=14).grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(opt, text=T("e_end")).grid(row=0, column=2, sticky="w")
+        self.end_var = app.v("end", "")
+        ttk.Entry(opt, textvariable=self.end_var, width=14).grid(row=0, column=3, sticky="w", padx=4)
+        ttk.Button(opt, text=T("e_video_auto"), width=12,
+                   command=self._autodetect_video).grid(row=0, column=4, sticky="w", padx=(4, 0))
+        ttk.Button(opt, text=T("e_fill_video"), width=12,
+                   command=self._fill_from_video).grid(row=0, column=5, sticky="w", padx=(4, 0))
+        ttk.Label(opt, text=T("e_tc_hint"), foreground="#888").grid(row=0, column=6, sticky="w")
+
+        # v1.2.0：视频余量 / 兜底时长（config 记忆，批量对话框沿用）
+        mrow = tk.Frame(opt, bg=pal["SURFACE"])
+        mrow.grid(row=1, column=0, columnspan=7, sticky="w", pady=(4, 0))
+        ttk.Label(mrow, text=T("e_margin")).pack(side="left")
+        # v1.3.0：默认 0（旧默认 240 = 每条片子都被加 4 分钟尾巴）
+        self.margin_var = app.v("video_margin",
+                                str(app.cfg.get("video_margin", DEFAULT_VIDEO_MARGIN)))
+        ttk.Spinbox(mrow, from_=0, to=3600, increment=10, width=7,
+                    textvariable=self.margin_var).pack(side="left", padx=(2, 12))
+        ttk.Label(mrow, text=T("e_fallback")).pack(side="left")
+        # v1.3.0：默认 60（旧默认 240 = 没检出视频时假装片子 4 分钟，会截断长片）
+        self.fallback_var = app.v("fallback_duration",
+                                  str(app.cfg.get("fallback_duration",
+                                                  DEFAULT_FALLBACK_DURATION)))
+        ttk.Spinbox(mrow, from_=1, to=3600, increment=10, width=7,
+                    textvariable=self.fallback_var).pack(side="left", padx=(2, 12))
+        ttk.Label(mrow, text=T("e_video_margin_note"),
+                  foreground="#888").pack(side="left", padx=(0, 16))
+        self.by_session_var = app.v("out_by_session",
+                                    "1" if app.cfg.get("out_by_session", True) else "0")
+        ttk.Checkbutton(mrow, text=T("e_by_session"),
+                        variable=self.by_session_var,
+                        onvalue="1", offvalue="0").pack(side="left")
+
+        ttk.Label(opt, text=T("e_sr")).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.sr_var = app.v("sample_rate", str(SAMPLE_RATES[0]))
+        ttk.Combobox(opt, textvariable=self.sr_var, values=[str(x) for x in SAMPLE_RATES],
+                     state="readonly", width=10).grid(row=2, column=1, sticky="w", padx=4, pady=(4, 0))
+        ttk.Label(opt, text=T("e_bd")).grid(row=2, column=2, sticky="w")
+        self.bd_var = app.v("bit_depth", "24")
+        ttk.Combobox(opt, textvariable=self.bd_var, values=[str(x) for x in BIT_DEPTHS],
+                     state="readonly", width=8).grid(row=2, column=3, sticky="w", padx=4, pady=(4, 0))
+        ttk.Label(opt, text=T("e_fmt")).grid(row=2, column=4, sticky="w")
+        # v1.3.0：默认 interleaved（旧默认 mono 会把立体声静默下混）+ 中文显示名
+        self.fmt_var = app.v("format", fmt_display_of(app.cfg.get("format")))
+        ttk.Combobox(opt, textvariable=self.fmt_var, values=fmt_choices(),
+                     state="readonly", width=26).grid(row=2, column=5, sticky="w", padx=4, pady=(4, 0))
+
+        # v1.3.0：剔除空轨道（Q7）—— 空轨默认不导，且可查看/撤回
+        erow = tk.Frame(opt, bg=pal["SURFACE"])
+        erow.grid(row=4, column=0, columnspan=7, sticky="w", pady=(4, 0))
+        self.exclude_empty_var = app.v("exclude_empty",
+                                       "1" if app.cfg.get("exclude_empty", True) else "0")
+        ttk.Checkbutton(erow, text=T("e_exclude_empty"),
+                        variable=self.exclude_empty_var, onvalue="1", offvalue="0",
+                        command=self._on_param_changed).pack(side="left")
+        self.excluded_btn = ttk.Button(erow, text=T("e_excluded_view") % 0,
+                                       command=self._show_excluded, state="disabled")
+        self.excluded_btn.pack(side="left", padx=(12, 0))
+
+        ttk.Label(opt, text=T("e_out")).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.out_var = app.v("export_out", app.cfg.get("last_out_dir", ""))
+        self.out_entry = ttk.Entry(opt, textvariable=self.out_var)
+        self.out_entry.grid(row=3, column=1, columnspan=4, sticky="we", padx=4, pady=(4, 0))
+        self.out_browse_btn = ttk.Button(opt, text=T("e_browse"), command=self._browse_out)
+        self.out_browse_btn.grid(row=3, column=5, sticky="w", padx=4)
+        # v1.3.0：输出目录锁定（Q3）+ 落盘预览（Q6）
+        self.out_locked = False
+        self.out_lock_btn = ttk.Button(opt, text=T("e_lock"), width=8,
+                                       command=self._toggle_out_lock)
+        self.out_lock_btn.grid(row=3, column=6, sticky="w", padx=(4, 0))
+        ttk.Button(opt, text=T("e_out_preview"), width=14,
+                   command=self._preview_out_paths).grid(row=3, column=7, sticky="w", padx=(4, 0))
+
+        # -- 参数变化联动：勾选联动 + 预览失效闸门（v1.1.0 补实装）
+        #    此前 UI 文案承诺「参数一变执行按钮熄灭」但从未比对签名——现绑定 trace 补齐
+        for _var in (self.mode_mix_var, self.mode_stem_var, self.stem_aux_var,
+                     self.mode_bus_var, self.mode_track_var,
+                     self.start_var, self.end_var, self.sr_var, self.bd_var,
+                     self.fmt_var, self.out_var, self.session_var,
+                     self.sess_mode_var, self.profile_var,
+                     self.margin_var, self.fallback_var, self.by_session_var,
+                     self.exclude_empty_var):
+            _var.trace_add("write", lambda *a: self._on_param_changed())
+        self._sync_mode_gating()
+
+        # -- 执行行（A2：主按钮唯一赤陶 PixelButton；玻璃档自动圆角分档）
+        btnrow = tk.Frame(self, bg=bg)
+        btnrow.pack(fill="x", pady=(PAD_SM, 0))
+        self.preview_btn = PixelButton(btnrow, text=T("e_preview"), icon="eye",
+                                       command=self.do_preview)
+        self.preview_btn.pack(side="left")
+        self.export_btn = PixelButton(btnrow, text=T("e_export"), icon="play",
+                                      command=self.do_export, primary=True)
+        self.export_btn.pack(side="left", padx=8)
+        self.batch_btn = PixelButton(btnrow, text=T("e_batch"), icon="grid",
+                                     command=self.open_batch_dialog)
+        self.batch_btn.pack(side="left", padx=8)
+        ttk.Label(btnrow, text=T("e_verify"),
+                  style="Dim.TLabel").pack(side="right")
+
+        # G1（v2.6.6 / B批）：档案 json 与输出目录支持拖入
+        # （tkinterdnd2 缺席时 enable_path_drop 静默跳过，行为不变）
+        enable_path_drop(self.entry_profile, self._drop_profile)
+        enable_path_drop(self.out_entry, self._drop_out)
+
+    def rebuild_cards(self):
+        """风格档案切换时换壳重建（_set_button_style 调用）；按钮态重建后回刷。
+
+        v3.14.0 P1-5/P1-6：busy 跳过（返回 False）+ 快照/回填界面变量
+        （同 ScanTab.rebuild_cards 注记）。
+        """
+        if getattr(self, "busy", False):
+            return False
+        snap = self.app._snapshot_vars()
+        self._build()
+        self.app._restore_vars(snap)
+        self.refresh_buttons()
+        return True
+
+    def _drop_profile(self, paths):
+        """G1：拖入档案 json —— 直接走既有加载链（含校验与自动应用）。"""
+        p = paths[0]
+        self.app.log("[drop] 档案：%s\n" % p)
+        self._load_profile(p)
+
+    def _drop_out(self, paths):
+        """G1：拖入输出目录（或任一路径）→ 填入输出目录并使预览失效。"""
+        p = paths[0]
+        self.out_var.set(p)
+        self.app.log("[drop] 输出目录：%s\n" % p)
+        self._invalidate_preview()
+
+    # ---------------- 档案与数据 ----------------
+
+    def _browse_profile(self):
+        # v1.4.0：没加载过档案时，默认打开建档输出目录（profile_dir），
+        # 而不是系统「最近的」某个无关目录 —— 档案就该在档案库里找。
+        initial = os.path.dirname(self.profile_var.get()) if self.profile_var.get() \
+            else (self.app.cfg.get("profile_dir") or None)
+        path = filedialog.askopenfilename(
+            title=T("choose_profile_title"),
+            filetypes=[("JSON", "*.json")],
+            initialdir=initial or None)
+        if path:
+            self._load_profile(path)
+
+    def on_profile_loaded(self, path, data):
+        self._load_profile(path, data)
+
+    def _load_profile(self, path, data=None):
+        try:
+            if data is None:
+                data = load_profile(path)
+        except ValueError as exc:
+            messagebox.showerror(T("msg_profile_invalid"), str(exc))
+            return
+        self._profile_path = path
+        self._profile = data
+        self.profile_var.set(path)
+        sess = data["session"]
+        if not self.end_var.get() and sess.get("length"):
+            self.end_var.set(sess["length"])
+        sr = sess.get("sample_rate")
+        if sr and str(sr) in [str(x) for x in SAMPLE_RATES]:
+            self.sr_var.set(str(sr))
+        # v1.4.0（Q·指定文件默认父级）：档案里记着扫描时的 .ptx 路径（= PT 当前
+        # 打开的工程）。此刻若处于「指定文件」模式且框是空的，直接预填它 ——
+        # 点「浏览」也会默认开在其父级目录，不用每次手翻。
+        if self.sess_mode_var.get() == "file" and not self.session_var.get().strip():
+            sp = (sess.get("path") or "").strip()
+            if sp:
+                self.session_var.set(sp)
+        self._reload_sources()
+        self.refresh_buttons()
+
+    def _reparse_exclude(self):
+        """排除名单 → pattern 列表（逗号分隔；含 * ? 按通配，否则精确）。"""
+        import fnmatch
+        raw = (self.exclude_var.get() or "").strip()
+        self._exclude_pats = [x.strip() for x in raw.split(",") if x.strip()]
+        self._exclude_fn = fnmatch.fnmatchcase
+
+    def _on_exclude_changed(self, *_a):
+        """排除名单变化：重解析 + 重渲染列表 + 存配置。"""
+        self._reparse_exclude()
+        self.app.cfg["track_exclude"] = self.exclude_var.get().strip()
+        save_config(self.app.cfg)
+        self._reload_sources()
+        self._invalidate_preview()
+
+    def _track_excluded(self, name):
+        return any(self._exclude_fn(name, p) for p in self._exclude_pats)
+
+    def _track_default_checked(self, t, name):
+        """默认勾选规则：有音频块 且 不在排除名单（用户手动勾选不受影响）。"""
+        clips = (t.get("attributes") or {}).get("contains_clips")
+        if clips is None:
+            clips = t.get("contains_clips")
+        if clips is False:
+            return False
+        return not self._track_excluded(name)
+
+    def _reload_sources(self):
+        """档案轨道 → 勾选式列表（选/名称/类型/音频块）。
+
+        v1.2.0：默认勾选 = 有音频块 且 不在排除名单；空轨与排除轨灰显标注。
+        用户此前手动勾过的轨道保持原状（switch 到别的档案时重置）。
+        """
+        new_profile = self._profile_path != getattr(self, "_loaded_for", None)
+        if new_profile:
+            self.track_checked = set()
+            self._loaded_for = self._profile_path
+        self.src_tree.delete(*self.src_tree.get_children())
+        if not self._profile:
+            self._update_src_count()
+            return
+        q = self.search_var.get().strip().lower()
+        for t in self._profile.get("tracks", []):
+            name = t.get("name", "")
+            if q and q not in name.lower():
+                continue
+            clips = (t.get("attributes") or {}).get("contains_clips")
+            excluded = self._track_excluded(name)
+            if excluded:
+                self.track_checked.discard(name)
+            elif self._track_default_checked(t, name) and new_profile:
+                self.track_checked.add(name)
+            checked = name in self.track_checked
+            sel_txt = "☑" if checked else "☐"
+            clip_txt = (T("e_clips_yes") if clips is not False
+                        else T("e_clips_no"))
+            fmt_txt = self._fmt_cell_text(name)
+            if excluded:
+                self.src_tree.insert("", "end", iid=name, tags=("excluded",),
+                                     values=(sel_txt,
+                                             name + T("e_excluded_mark"),
+                                             t.get("type", ""), clip_txt,
+                                             fmt_txt))
+            elif clips is False:
+                self.src_tree.insert("", "end", iid=name, tags=("empty",),
+                                     values=(sel_txt, name,
+                                             t.get("type", ""), clip_txt,
+                                             fmt_txt))
+            else:
+                self.src_tree.insert("", "end", iid=name,
+                                     values=(sel_txt, name,
+                                             t.get("type", ""), clip_txt,
+                                             fmt_txt))
+        try:
+            self.src_tree.tag_configure("excluded", foreground="#999")
+            self.src_tree.tag_configure("empty", foreground="#777")
+        except tk.TclError:
+            pass
+        self._update_src_count()
+        self._update_excluded_btn()
+
+    # ---------------- 单轨声道 / 剔除空轨（v1.3.0 · Q5 Q7）----------------
+
+    def _fmt_cell_text(self, name):
+        """轨道列表「声道」列的显示文本（未单独指定 = 跟随全局）。"""
+        v = self.track_fmt.get(name)
+        return fmt_label(v) if v else T("e_fmt_follow")
+
+    def _cycle_track_fmt(self, iid):
+        """点击「声道」列 → 在 跟随全局 / 立体声 / 单声道 / 每声道独立 间循环。"""
+        cur = self.track_fmt.get(iid, FORMAT_FOLLOW)
+        try:
+            nxt = TRACK_FMT_CYCLE[(TRACK_FMT_CYCLE.index(cur) + 1) % len(TRACK_FMT_CYCLE)]
+        except ValueError:
+            nxt = FORMAT_FOLLOW
+        if nxt == FORMAT_FOLLOW:
+            self.track_fmt.pop(iid, None)
+        else:
+            self.track_fmt[iid] = nxt
+        vals = list(self.src_tree.item(iid)["values"])
+        if len(vals) < 5:
+            vals += [""] * (5 - len(vals))
+        vals[4] = self._fmt_cell_text(iid)
+        self.src_tree.item(iid, values=vals)
+        self._invalidate_preview()
+
+    def _empty_track_names(self):
+        """档案里无音频块的轨道名（剔除空轨的候选名单）。"""
+        if not self._profile:
+            return []
+        out = []
+        for t in self._profile.get("tracks", []):
+            clips = (t.get("attributes") or {}).get("contains_clips")
+            if clips is None:
+                clips = t.get("contains_clips")
+            if clips is False:
+                out.append(t.get("name", ""))
+        return [x for x in out if x]
+
+    def _dropped_names(self):
+        """实际被剔除的（空轨 减去 用户加回的）。"""
+        return [n for n in self._empty_track_names()
+                if n not in self.track_restored]
+
+    def _update_excluded_btn(self):
+        n = len(self._dropped_names())
+        if not getattr(self, "excluded_btn", None):
+            return
+        self.excluded_btn.configure(
+            text=T("e_excluded_view") % n,
+            state="normal" if n else "disabled")
+
+    def _show_excluded(self):
+        """查看被剔除的轨道 —— 逐条可「加回」（撤回）。"""
+        names = self._dropped_names()
+        if not names:
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title(T("e_excluded_title"))
+        dlg.transient(self.winfo_toplevel())
+        dlg.geometry("420x320")
+        dlg.grab_set()
+        ttk.Label(dlg, text=T("e_excluded_title"),
+                  padding=(10, 8)).pack(fill="x")
+        lst = tk.Listbox(dlg)
+        lst.pack(fill="both", expand=True, padx=10)
+        for n in names:
+            lst.insert("end", n)
+
+        def restore():
+            sel = lst.curselection()
+            if not sel:
+                return
+            name = lst.get(sel[0])
+            self.track_restored.add(name)          # 豁免剔除（撤回）
+            self.track_checked.add(name)           # 加回 = 重新勾选
+            self._reload_sources()
+            self.app.log(T("e_restored") % name)
+            self._invalidate_preview()
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg)
+        btns.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btns, text=T("e_restore"),
+                   command=restore).pack(side="left")
+        ttk.Button(btns, text=T("e_close"),
+                   command=dlg.destroy).pack(side="right")
+        lst.bind("<Double-1>", lambda _e: restore())
+        center_on_parent(dlg, self)
+
+    def _on_track_click(self, event):
+        """点击行切换勾选（点在「选」列或行任意处均可；滚动条除外）。
+
+        v1.3.0：点在**「声道」列**时改为循环切换该轨的格式（跟随全局 → 立体声
+        → 单声道 → 每声道独立），而不是改勾选 —— 这是 Q5「每条轨道各选各的」。
+        """
+        region = self.src_tree.identify("region", event.x, event.y)
+        if region not in ("cell", "tree"):
+            return
+        iid = self.src_tree.identify_row(event.y)
+        if not iid:
+            return
+        col = self.src_tree.identify_column(event.x)
+        if col == "#5":          # 第 5 列 = 声道
+            self._cycle_track_fmt(iid)
+            return
+        if iid in self.track_checked:
+            self.track_checked.discard(iid)
+        else:
+            self.track_checked.add(iid)
+        vals = list(self.src_tree.item(iid)["values"])
+        vals[0] = "☑" if iid in self.track_checked else "☐"
+        self.src_tree.item(iid, values=vals)
+        self._update_src_count()
+        self._invalidate_preview()
+
+    def _set_all_tracks(self, checked: bool):
+        """全选 / 全不选（作用于当前列表所有行，含空轨与排除轨——
+        全选是显式意图，覆盖默认规则）。"""
+        for iid in self.src_tree.get_children():
+            vals = list(self.src_tree.item(iid)["values"])
+            vals[0] = "☑" if checked else "☐"
+            self.src_tree.item(iid, values=vals)
+        if checked:
+            self.track_checked = set(self.src_tree.get_children())
+        else:
+            self.track_checked = set()
+        self._update_src_count()
+        self._invalidate_preview()
+
+    def _update_src_count(self):
+        self.src_count_var.set(T("e_selected") % len(self.track_checked))
+
+    # ---------------- 模式联动与预览闸门 ----------------
+
+    def _mode_on(self, m):
+        return {"mix": self.mode_mix_var, "stem": self.mode_stem_var,
+                "bus": self.mode_bus_var,
+                "track": self.mode_track_var}[m].get() == "1"
+
+    def _sync_mode_gating(self):
+        """勾选联动（v1.2.0）：STEM 或「按轨道名称」任一勾选时轨道列表可交互
+        （STEM 勾选轨 = 只导勾选的；全不勾 = 全轨模式）；
+        未勾 STEM 时 aux 子项禁用。"""
+        track_on = self.mode_track_var.get() == "1"
+        stem_on = self.mode_stem_var.get() == "1"
+        try:
+            self.src_tree.state(["!disabled"] if (track_on or stem_on)
+                                else ["disabled"])
+            self.cb_stem_aux.state(["!disabled"] if stem_on else ["disabled"])
+        except tk.TclError:
+            pass
+
+    def _on_param_changed(self):
+        self._sync_mode_gating()
+        self._invalidate_preview()
+
+    def _invalidate_preview(self):
+        """参数变化后使预览失效（执行按钮熄灭），需重新预览才能导出。"""
+        if self.preview_ok and self._param_signature() != self._preview_signature:
+            self.preview_ok = False
+            self._preview_signature = ""
+            self.refresh_buttons()
+
+    # ---------------- 参数收集与校验 ----------------
+
+    def _selected_sources(self):
+        """勾选的轨道名（按档案顺序，不在列表中的勾选如跨档案残留则忽略）。
+
+        v1.3.0（Q7）：勾选「剔除空轨道」时，空轨一律不进选中列表 ——
+        **怎么选都不导出**（此前空轨只是"默认不勾"，用户一勾就又导了）。
+        在「查看被剔除」里点「加回」的轨道会记进 `track_restored`，豁免剔除。
+        """
+        known = set(self.src_tree.get_children())
+        picked = [n for n in self.track_checked if n in known]
+        if self.exclude_empty_var.get() != "1":
+            return picked
+        empty = set(self._empty_track_names()) - self.track_restored
+        return [n for n in picked if n not in empty]
+
+    def _param_signature(self):
+        return json.dumps({
+            "profile": self._profile_path,
+            "modes": [m for m in EXPORT_MODES if self._mode_on(m)],
+            "stem_aux": self.stem_aux_var.get() == "1",
+            "tracks": self._selected_sources(),
+            "start": self.start_var.get(),
+            "end": self.end_var.get(),
+            "sr": self.sr_var.get(),
+            "bd": self.bd_var.get(),
+            "fmt": self.fmt_var.get(),
+            "track_fmt": dict(self.track_fmt),
+            "exclude_empty": self.exclude_empty_var.get(),
+            "out": self.out_var.get(),
+            "session": self.session_var.get()
+                       if self.sess_mode_var.get() == "file" else "",
+        }, ensure_ascii=False)
+
+    def _resolve_out_dir(self):
+        """输出目录（v1.2.0）：勾「输出按工程名建夹」时拼 <输出根>/<工程名>。"""
+        base = self.out_var.get().strip()
+        if self.by_session_var.get() == "1" and self._profile:
+            name = ((self._profile.get("session") or {}).get("name") or "").strip()
+            if name:
+                base = os.path.join(base, name)
+        return base
+
+    def _build_cmds(self, dry_run):
+        """构造 CLI 命令列表（--profile 必须在子命令前）。失败抛 ValueError。"""
+        if not self._profile:
+            raise ValueError(T("msg_no_profile"))
+        sess = None
+        if self.sess_mode_var.get() == "file":
+            sess = self.session_var.get().strip()
+            if not sess:
+                raise ValueError(T("msg_sess_missing"))
+        # v1.4.0：输出目录不存在就现建（出厂默认 Backup-PT-Tools/out 首次
+        # 使用时还没有实体目录），别等 exporter 写文件时才失败。
+        out_dir = self._resolve_out_dir()
+        if out_dir:
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except OSError as exc:
+                raise ValueError(T("msg_out_missing") + "\n%s\n%s" % (out_dir, exc))
+        stem_on = self.mode_stem_var.get() == "1"
+        track_on = self.mode_track_var.get() == "1"
+        picked = self._selected_sources()
+        return build_export_cmds(
+            self.app.resolver.venv_python,
+            self.app.resolver.script("pt-exporter"),
+            self._profile_path,
+            self._profile,
+            modes=[m for m in EXPORT_MODES if self._mode_on(m)],
+            stem_aux=self.stem_aux_var.get() == "1",
+            tracks=picked if track_on else [],
+            # STEM 勾选式：列表里有勾选 → 只导勾选轨；全不勾 → 全轨模式
+            stem_tracks=picked if (stem_on and picked) else [],
+            exclude_names=self._exclude_pats,
+            session=sess,
+            out=out_dir,
+            start=self.start_var.get().strip(),
+            end=self.end_var.get().strip(),
+            sample_rate=self.sr_var.get(),
+            bit_depth=self.bd_var.get(),
+            fmt=self.fmt_var.get(),
+            dry_run=dry_run,
+            # v1.3.0：每条轨道可覆盖全局格式（Q5）
+            track_formats=dict(self.track_fmt),
+            exclude_empty=self.exclude_empty_var.get() == "1",
+        )
+
+    # ---------------- 视频锁定时长（v1.2.0：自动检索 + 手动选择）----------------
+
+    def _export_scripts_dir(self):
+        return os.path.dirname(self.app.resolver.script("pt-exporter"))
+
+    def _session_video_roots(self):
+        """视频检索候选根（v1.3.0 · Q1）——按顺序试，第一个检出视频的即用。
+
+        旧逻辑只查「.ptx 所在目录」向下 8 层，而实际工程里视频通常放在
+        **.ptx 的父级**（如 ``D:\\<工程盘>\\<项目>\\Video\\`` 与 .ptx 目录并列），
+        os.walk 只向下不向上，于是永远扫不到 —— 这就是"自动检测总是不对"的根因。
+        现在候选链：.ptx 同级 → 父目录 → 祖父目录（去重，只保留真实存在的）。
+        """
+        p = ""
+        if self.sess_mode_var.get() == "file" and self.session_var.get().strip():
+            p = self.session_var.get().strip()
+        elif self._profile:
+            p = (self._profile.get("session") or {}).get("path") or ""
+        if not p:
+            return []
+        out, seen = [], set()
+        cur = os.path.dirname(os.path.abspath(p))
+        for _ in range(3):
+            if cur and cur not in seen and os.path.isdir(cur):
+                out.append(cur)
+                seen.add(cur)
+            parent = os.path.dirname(cur)
+            if not parent or parent == cur:
+                break
+            cur = parent
+        return out
+
+    def _session_video_root(self):
+        roots = self._session_video_roots()
+        return roots[0] if roots else ""
+
+    def _session_fps(self):
+        try:
+            return float(str(self._profile["session"].get("timecode_rate")
+                             or "25").split()[0])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return 25.0
+
+    def _apply_video_duration(self, dur_sec, video_name):
+        """end = 视频时长 + 余量（帧域换算），开始固定 00:00:00:00。"""
+        fps = self._session_fps()
+        try:
+            margin = max(float(self.margin_var.get() or 0), 0)
+        except ValueError:
+            margin = 0
+        tc = frame_to_tc(round((float(dur_sec) + margin) * fps), fps)
+        self.start_var.set("00:00:00:00")
+        self.end_var.set(tc)
+        self.app.log(T("e_video_applied") % (video_name, tc, margin))
+
+    def _autodetect_video(self):
+        """工程目录树自动检索视频 → 1 条直接应用；多条弹窗选择；0 条提示。
+
+        v1.3.0（Q1）：检索根改**候选链**（.ptx 同级 → 父级 → 祖父级），
+        逐个试到检出为止，并把实际检索到的那个根写进日志，做到可核对。
+        """
+        if not self._profile:
+            messagebox.showerror(T("msg_missing"), T("msg_no_profile"))
+            return
+        roots = self._session_video_roots()
+        if not roots:
+            self.app.log(T("e_video_none"))
+            return
+        script = os.path.join(self._export_scripts_dir(),
+                              "find_session_videos.py")
+        if not os.path.isfile(script):
+            self.app.log(T("e_video_fail") % ("script missing: %s" % script))
+            return
+        self.app.log(T("e_video_root_note") + "：\n")
+        for r in roots:
+            self.app.log("    · %s\n" % r)
+        threading.Thread(target=self._video_detect_worker, daemon=True,
+                         args=(script, roots)).start()
+
+    def _video_detect_worker(self, script, roots):
+        """按候选根顺序检索，第一个检出视频的根即采用。"""
+        for root in roots:
+            try:
+                p = subprocess.run(
+                    [self.app.resolver.venv_python, script,
+                     "--dir", root, "--profile", self._profile_path],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=120,
+                    creationflags=CREATE_NO_WINDOW)
+                text = p.stdout or ""
+            except Exception as exc:
+                self.app.after(0, lambda e=str(exc): self.app.log(
+                    T("b_search_fail") % e))
+                return
+            data = None
+            try:
+                start = text.index("{")
+                data = json.loads(text[start:text.rindex("}") + 1])
+            except (ValueError, json.JSONDecodeError):
+                data = None
+            if (data or {}).get("videos"):
+                self.app.after(0, lambda d=data, r=root: self._video_detect_done(d, r))
+                return
+            self.app.after(0, lambda r=root: self.app.log(
+                T("e_video_root_empty") % r))
+        self.app.after(0, lambda: self._video_detect_done(None, ""))
+
+    def _video_detect_done(self, data, root=""):
+        videos = (data or {}).get("videos") or []
+        if not videos:
+            self.app.log(T("e_video_none"))
+            return
+        if root:
+            self.app.log(T("e_video_root_hit") % root)
+        if len(videos) == 1:
+            v = videos[0]
+            self.app.log(T("e_video_found1") % v.get("name", ""))
+            self._apply_video_duration(v["duration_sec"], v.get("name", ""))
+            return
+        self.app.log(T("e_video_found_n") % len(videos))
+        picked = self._video_choose_dialog(videos)
+        if picked:
+            self._apply_video_duration(picked["duration_sec"],
+                                       picked.get("name", ""))
+
+    def _video_choose_dialog(self, videos):
+        """模态视频选择窗：清单（名称/时长/路径）→ 返回选中 dict 或 None。"""
+        dlg = tk.Toplevel(self)
+        dlg.title(T("e_video_pick_title"))
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+        dlg.resizable(True, True)
+        tree = ttk.Treeview(dlg, columns=("name", "dur", "path"),
+                            show="headings", height=8)
+        tree.heading("name", text=T("e_name_col"))
+        tree.heading("dur", text=T("e_clips_col"))
+        tree.heading("path", text="Path")
+        tree.column("name", width=220)
+        tree.column("dur", width=70, anchor="center", stretch=False)
+        tree.column("path", width=380)
+        tree.pack(fill="both", expand=True, padx=10, pady=10)
+        fit_tree_columns(tree, min_widths={"name": 140, "dur": 56, "path": 180})
+        for i, v in enumerate(videos):
+            tree.insert("", "end", iid=str(i), values=(
+                v.get("name", ""), "%.1fs" % v.get("duration_sec", 0),
+                v.get("path", "")))
+        tree.selection_set("0")
+        result = {"picked": None}
+
+        def confirm(_e=None):
+            sel = tree.selection()
+            if sel:
+                result["picked"] = videos[int(sel[0])]
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg)
+        btns.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btns, text="OK", command=confirm).pack(side="right")
+        ttk.Button(btns, text="Cancel",
+                   command=dlg.destroy).pack(side="right", padx=6)
+        tree.bind("<Double-1>", confirm)
+        center_on_parent(dlg, self)
+        dlg.wait_window()
+        return result["picked"]
+
+    def _fill_from_video(self):
+        """手动选视频文件 → video_duration.py 读时长 → 应用（含余量）。"""
+        if not self._profile:
+            messagebox.showerror(T("msg_missing"), T("msg_no_profile"))
+            return
+        path = filedialog.askopenfilename(
+            title=T("e_video_title"),
+            filetypes=[("Video", "*.mp4 *.mov *.m4v *.webm"), ("All", "*.*")])
+        if not path:
+            return
+        script = os.path.join(self._export_scripts_dir(),
+                              "video_duration.py")
+        if not os.path.isfile(script):
+            self.app.log(T("e_video_fail") % ("script missing: %s" % script))
+            return
+        self.app.log(T("e_video_running") % os.path.basename(path))
+        threading.Thread(target=self._video_worker, daemon=True,
+                         args=(script, path)).start()
+
+    def _video_worker(self, script, video):
+        """后台读视频时长（venv python 冷启动约 1~2 秒，不阻塞 UI）。"""
+        try:
+            p = subprocess.run(
+                [self.app.resolver.venv_python, script, video,
+                 "--profile", self._profile_path],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=60,
+                creationflags=CREATE_NO_WINDOW)
+            text = (p.stdout or "") + (p.stderr or "")
+        except Exception as exc:
+            text = str(exc)
+        tc = parse_video_duration_output(text)
+        self.app.after(0, lambda: self._video_apply(tc, text, video))
+
+    def _video_apply(self, tc, raw, video=""):
+        if not tc:
+            lines = [x for x in (raw or "").strip().splitlines() if x.strip()]
+            self.app.log(T("e_video_fail") % (lines[-1] if lines else "?"))
+            return
+        # 人工模式同样叠加余量：tc → 帧 → +margin → 回时码
+        try:
+            margin = max(float(self.margin_var.get() or 0), 0)
+        except ValueError:
+            margin = 0
+        fps = self._session_fps()
+        tc = frame_to_tc(tc_to_frame(tc, fps) + int(round(margin * fps)), fps)
+        self.start_var.set("00:00:00:00")
+        self.end_var.set(tc)
+        self.app.log(T("e_video_ok") % tc)
+
+    # ---------------- 操作 ----------------
+
+    def refresh_buttons(self):
+        has_profile = self._profile is not None
+        self.preview_btn.set_enabled(not (self.busy or not has_profile))
+        can_export = (has_profile and self.preview_ok and self.app.ptsl_on
+                      and not self.busy)
+        self.export_btn.set_enabled(can_export)
+
+    def do_preview(self):
+        try:
+            cmds = self._build_cmds(dry_run=True)
+        except ValueError as exc:
+            messagebox.showerror(T("msg_invalid"), str(exc))
+            return
+        self.busy = True
+        self.refresh_buttons()
+        self.preview_ok = False
+        self._preview_signature = ""
+        self._last_was_export = False      # 预演不触发质检
+        self.app.log(T("preview_start"))
+        self.app.start_worker(cmds)
+
+    def do_export(self):
+        if not self.preview_ok:
+            messagebox.showwarning(T("msg_preview_first_title"),
+                                   T("msg_preview_first_body"))
+            return
+        try:
+            cmds = self._build_cmds(dry_run=False)
+        except ValueError as exc:
+            messagebox.showerror(T("msg_invalid"), str(exc))
+            return
+        if not self.app.ptsl_on:
+            messagebox.showerror(T("msg_invalid"), T("msg_ptsl_off_export"))
+            return
+        if not messagebox.askyesno(T("msg_confirm_title"), T("msg_confirm_body")):
+            return
+        self.busy = True
+        self.refresh_buttons()
+        self._last_was_export = True
+        self._qc_since = time.time()
+        self.app.start_worker(cmds)
+
+    def on_worker_done(self, returncode):
+        if not self.busy:
+            return
+        self.busy = False
+        if returncode == 0:
+            if self._preview_signature == "":
+                self.preview_ok = True
+                self._preview_signature = self._param_signature()
+                self.app.log(T("preview_pass"))
+            else:
+                self.preview_ok = False
+                self._preview_signature = ""
+            # P2（v1.5.0）：真导出成功 → 后台质检本次落盘的 wav
+            if self._last_was_export:
+                self._run_export_qc()
+        self.refresh_buttons()
+
+    # ---------------- 导出质检（P2 · v1.5.0）----------------
+
+    def _expected_export_dir(self):
+        """本次导出的落盘目录（与 _build_cmds 的 _resolve_out_dir 同规则）。"""
+        out = self.out_var.get().strip()
+        if self.by_session_var.get() == "1" and self._profile:
+            name = ((self._profile.get("session") or {}).get("name") or "").strip()
+            if name:
+                out = os.path.join(out, name)
+        return out
+
+    def _run_export_qc(self):
+        from ptools.core.qc import qc_wavs   # noqa: F401  提前 import 触发语法自检
+        out_dir = self._expected_export_dir()
+        if not out_dir or not os.path.isdir(out_dir):
+            self.app.log(T("qc_none") + "\n")
+            return
+        try:
+            fps = self._session_fps()
+            start = self.start_var.get().strip()
+            end = self.end_var.get().strip()
+            expected = None
+            if fmt_tc_ok(start) and fmt_tc_ok(end):
+                expected = (tc_to_frame(end, fps) - tc_to_frame(start, fps)) / fps
+        except Exception:
+            expected = None
+        self.app.log(T("qc_running"))
+        threading.Thread(
+            target=self._qc_worker, daemon=True,
+            args=(out_dir, self._qc_since, self.sr_var.get(),
+                  self.bd_var.get(), expected)).start()
+
+    def _qc_worker(self, out_dir, since_ts, sr, bd, expected):
+        """后台核对 wav 头（不阻塞 UI），报告经 after 切回主线程渲染。"""
+        from ptools.core.qc import qc_wavs
+        try:
+            checked, issues = qc_wavs(out_dir, since_ts=since_ts,
+                                      expected_sr=sr, expected_bd=bd,
+                                      expected_dur_sec=expected)
+        except Exception as exc:
+            self.app.after(0, lambda e=exc: self.app.log(
+                "[qc] %s\n" % e, "err"))
+            return
+
+        def report():
+            if not checked and not issues:
+                self.app.log(T("qc_none") + "\n")
+                return
+            if issues:
+                self.app.log((T("qc_bad") % (len(issues), len(checked))) + "\n",
+                             "err")
+                for p, why in issues[:50]:
+                    self.app.log("  ✗ %s — %s\n" % (os.path.basename(p), why),
+                                 "err")
+                if len(issues) > 50:
+                    self.app.log("  … 共 %d 条异常，仅显示前 50 条\n"
+                                 % len(issues), "err")
+            else:
+                self.app.log((T("qc_ok") % len(checked)) + "\n", "ok")
+            self.app.log(T("qc_note") + "\n")
+
+        self.app.after(0, report)
+
+    # ---------------- 小工具 ----------------
+
+    def _browse_out(self):
+        chosen = filedialog.askdirectory(
+            title=T("choose_outdir_title"),
+            initialdir=self.out_var.get() or None)
+        if chosen:
+            self.out_var.set(chosen)
+            self.app.cfg["last_out_dir"] = chosen
+            save_config(self.app.cfg)
+
+    def _browse_session(self):
+        # v1.4.0：浏览框默认开在「当前工程 .ptx 的父级目录」——
+        # 优先取框里已填路径的目录，其次取档案里记录的 session.path（PT
+        # 当前打开的工程）所在目录，都不存在才走系统默认。
+        initial = ""
+        cur = self.session_var.get().strip()
+        if cur:
+            initial = os.path.dirname(cur)
+        else:
+            sp = ((self._profile or {}).get("session") or {}).get("path") or ""
+            if sp:
+                initial = os.path.dirname(sp)
+        chosen = filedialog.askopenfilename(
+            title=T("choose_ptx_title"),
+            filetypes=[("Pro Tools Session", "*.ptx"), ("All", "*.*")],
+            initialdir=initial or None)
+        if chosen:
+            self.session_var.set(chosen)
+
+    def _on_sess_mode_change(self):
+        """v1.4.0：切到「指定文件」模式时预填当前工程的 .ptx 路径。
+
+        档案里的 session.path 就是扫描时 PT 打开的工程；预填后用户看到
+        的是完整默认值，要换工程点浏览（默认开在其父级）即可。"""
+        if self.sess_mode_var.get() == "file" and not self.session_var.get().strip():
+            sp = ((self._profile or {}).get("session") or {}).get("path") or ""
+            if sp:
+                self.session_var.set(sp)
+
+    # ---------------- 输出目录锁定 / 落盘预览（v1.3.0 · Q3 Q6）----------------
+
+    def _toggle_out_lock(self):
+        """输出目录锁定：锁定后禁止改动，防止换工程时误导出到上一个目录。"""
+        self.out_locked = not self.out_locked
+        st = "disabled" if self.out_locked else "normal"
+        self.out_entry.configure(state=st)
+        self.out_browse_btn.configure(state=st)
+        self.out_lock_btn.configure(
+            text=T("e_locked") if self.out_locked else T("e_lock"))
+
+    def _preview_out_paths(self):
+        """只读预览：本次导出会落到哪个目录、哪些文件（不写盘、不改任何状态）。"""
+        out = self.out_var.get().strip()
+        if not out:
+            messagebox.showerror(T("msg_invalid"), T("msg_out_missing"))
+            return
+        sess_name = ((self._profile or {}).get("session") or {}).get("name", "")
+        root = os.path.join(out, sess_name) if (
+            self.by_session_var.get() == "1" and sess_name) else out
+
+        srcs = (self._profile or {}).get("sources", {})
+        empty = set(self._empty_track_names())
+        picked = [i for i in self.src_tree.get_children()
+                  if i in self.track_checked]
+        if self.exclude_empty_var.get() == "1":
+            picked = [p for p in picked if p not in empty]
+
+        lines = [root, ""]
+        n = 0
+        if self._mode_on("mix"):
+            for name in (srcs.get("output") or []):
+                lines.append("  MIX   %s" % name)
+                n += 1
+        if self._mode_on("bus"):
+            for name in (srcs.get("bus") or []):
+                lines.append("  BUS   %s" % name)
+                n += 1
+        if self._mode_on("stem") or self._mode_on("track"):
+            for name in picked:
+                lines.append("  STEM  %s   （声道：%s）"
+                             % (name, self._fmt_cell_text(name)))
+                n += 1
+        if n == 0:
+            lines.append(T("e_out_preview_none"))
+        lines += ["", T("e_out_preview_total") % n]
+        if empty and self.exclude_empty_var.get() == "1":
+            lines.append(T("e_out_preview_dropped") % len(empty))
+
+        dlg = tk.Toplevel(self)
+        dlg.title(T("e_out_preview_title"))
+        dlg.transient(self.winfo_toplevel())
+        dlg.geometry("640x380")
+        txt = tk.Text(dlg, wrap="none", font=("Consolas", 10))
+        txt.insert("1.0", "\n".join(lines))
+        txt.configure(state="disabled")
+        txt.pack(fill="both", expand=True, padx=10, pady=10)
+        ttk.Button(dlg, text=T("e_close"),
+                   command=dlg.destroy).pack(pady=(0, 10))
+        center_on_parent(dlg, self)
+
+    # ---------------- 批量导出（v1.2.0）----------------
+
+    def open_batch_dialog(self):
+        if not self.app.ptsl_on:
+            messagebox.showerror(T("msg_invalid"), T("b_need_ptsl"))
+            return
+        if not self._profile:
+            messagebox.showerror(T("msg_missing"), T("msg_no_profile"))
+            return
+        BatchExportDialog(self)
+
+
+class BatchExportDialog(tk.Toplevel):
+    """多工程批量导出：前置检索视频（开 PT 前就选定），生成 jobs.json 交给
+    pt_batch_export.py 编排执行（open/close 守卫、逐工程扫描、产物核对都
+    在脚本侧，壳不动芯）。轨道规则沿用导出页当前设置。"""
+
+    def __init__(self, tab: "ExportTab"):
+        super().__init__(tab)
+        self.tab = tab
+        self.title(T("b_title"))
+        self.transient(tab.winfo_toplevel())
+        self.geometry("860x560")
+        self.rows: dict = {}          # ptx -> {"videos": [...], "picked": None}
+        center_on_parent(self, tab)
+
+        # -- 工程列表
+        box = ttk.LabelFrame(self, text="  " + T("b_ptx_frame") + "  ", padding=6)
+        box.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        btns = ttk.Frame(box)
+        btns.pack(fill="x")
+        ttk.Button(btns, text=T("b_add"), command=self._add_sessions).pack(side="left")
+        ttk.Button(btns, text=ICON_CROSS+" "+T("b_remove"), command=self._remove_selected,
+                   style="Danger.TButton").pack(side="left", padx=6)
+        ttk.Button(btns, text=T("b_rescan"), command=self._rescan_all).pack(side="left")
+        self.tree = ttk.Treeview(box, columns=("session", "video", "status"),
+                                 show="headings", height=10)
+        self.tree.heading("session", text=T("b_col_session"))
+        self.tree.heading("video", text=T("b_col_video"))
+        self.tree.heading("status", text=T("b_col_status"))
+        self.tree.column("session", width=330)
+        self.tree.column("video", width=260)
+        self.tree.column("status", width=160, anchor="center")
+        self.tree.pack(fill="both", expand=True, pady=(4, 0))
+        self.tree.bind("<Double-1>", self._on_double)
+        fit_tree_columns(self.tree, min_widths={"session": 180, "video": 140,
+                                                "status": 80})
+
+        # -- 策略
+        pol = ttk.LabelFrame(self, text="  " + T("b_policy_frame") + " / "
+                             + T("b_multi_frame") + "  ", padding=6)
+        pol.pack(fill="x", padx=10, pady=4)
+        ttk.Label(pol, text=T("b_policy_frame") + ":").pack(side="left")
+        self.no_video_var = tk.StringVar(value="fallback")
+        ttk.Radiobutton(pol, text=T("b_policy_fallback"), value="fallback",
+                        variable=self.no_video_var).pack(side="left", padx=(4, 14))
+        ttk.Radiobutton(pol, text=T("b_policy_skip"), value="skip",
+                        variable=self.no_video_var).pack(side="left")
+        ttk.Label(pol, text="    |    " + T("b_multi_frame") + ":").pack(side="left")
+        self.multi_var = tk.StringVar(value="skip")
+        ttk.Radiobutton(pol, text=T("b_multi_pick"), value="pick",
+                        variable=self.multi_var).pack(side="left", padx=(4, 14))
+        ttk.Radiobutton(pol, text=T("b_multi_skip"), value="skip",
+                        variable=self.multi_var).pack(side="left")
+
+        ttk.Label(self, text=T("b_rule_note"), foreground="#888",
+                  wraplength=820, justify="left").pack(
+            fill="x", padx=12, pady=(2, 0))
+
+        # -- 开始
+        start_row = ttk.Frame(self)
+        start_row.pack(fill="x", padx=10, pady=(4, 10))
+        # W8（v1.5.0）：白天空好任务清单存盘，夜里 `pt-tools --batch jobs.json` 执行
+        ttk.Button(start_row, text=T("b_save_jobs"),
+                   command=self._save_jobs).pack(side="left")
+        ttk.Button(start_row, text=ICON_PLAY+" "+T("b_start"), command=self._start,
+                   style="Accent.TButton").pack(side="right")
+
+    # ---- 行管理 ----
+
+    def _add_sessions(self):
+        files = filedialog.askopenfilenames(
+            title=T("choose_ptx_title"),
+            filetypes=[("Pro Tools Session", "*.ptx"), ("All", "*.*")])
+        for f in files:
+            if f in self.rows:
+                continue
+            self.rows[f] = {"videos": [], "picked": None}
+            self.tree.insert("", "end", iid=f, values=(
+                os.path.basename(f), T("b_video_none"), "…"))
+            self._search_one(f)
+        if files:
+            self.tree.selection_set(files[0])
+
+    def _remove_selected(self):
+        for iid in self.tree.selection():
+            self.rows.pop(iid, None)
+            self.tree.delete(iid)
+
+    def _rescan_all(self):
+        for f in list(self.rows):
+            self._search_one(f)
+
+    def _on_double(self, _e):
+        iid = self.tree.identify_row(_e.y)
+        if iid and (self.rows.get(iid, {}).get("videos")):
+            self._pick_video(iid)
+
+    @staticmethod
+    def _video_roots_for(ptx):
+        """候选检索根（与导出页同源）：.ptx 同级 → 父级 → 祖父级。"""
+        out, seen = [], set()
+        cur = os.path.dirname(os.path.abspath(ptx))
+        for _ in range(3):
+            if cur and cur not in seen and os.path.isdir(cur):
+                out.append(cur)
+                seen.add(cur)
+            parent = os.path.dirname(cur)
+            if not parent or parent == cur:
+                break
+            cur = parent
+        return out
+
+    def _search_one(self, ptx):
+        """后台检索一个工程的视频（不开 PT，纯文件系统）。"""
+        roots = self._video_roots_for(ptx)
+        script = os.path.join(self.tab._export_scripts_dir(),
+                              "find_session_videos.py")
+        if not os.path.isfile(script):
+            self._set_row(ptx, video=T("b_video_none"), status=T("b_search_fail") % "script missing")
+            return
+        self.tab.app.log(T("b_searching") % os.path.basename(ptx))
+        threading.Thread(target=self._search_worker, daemon=True,
+                         args=(ptx, script, roots)).start()
+
+    def _search_worker(self, ptx, script, roots):
+        """按候选根顺序检索，第一个检出视频的即用（v1.3.0 · Q1）。"""
+        if not roots:
+            self.after(0, lambda: self._search_done(ptx, None, "no search root"))
+            return
+        text = ""
+        for root in roots:
+            try:
+                p = subprocess.run(
+                    # 只给 --dir（脚本里显式 --dir 优先；同时给 --session 会被
+                    # 抢回 .ptx 同级目录，父级候选就永远走不到）
+                    [self.tab.app.resolver.venv_python, script,
+                     "--dir", root,
+                     "--profile", self.tab._profile_path],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=120,
+                    creationflags=CREATE_NO_WINDOW)
+                text = p.stdout or ""
+            except Exception as exc:
+                self.after(0, lambda e=str(exc): self._search_done(ptx, None, e))
+                return
+            data = None
+            try:
+                start = text.index("{")
+                data = json.loads(text[start:text.rindex("}") + 1])
+            except (ValueError, json.JSONDecodeError):
+                data = None
+            if (data or {}).get("videos"):
+                self.after(0, lambda d=data: self._search_done(ptx, d, ""))
+                return
+        self.after(0, lambda: self._search_done(ptx, None, text[-200:]))
+
+    def _search_done(self, ptx, data, raw):
+        row = self.rows.get(ptx)
+        if row is None:
+            return  # 行已被移除
+        videos = (data or {}).get("videos") or []
+        row["videos"] = videos
+        row["picked"] = None
+        if not videos:
+            self._set_row(ptx, video=T("b_video_none"),
+                          status=(T("b_policy_fallback")
+                                  if self.no_video_var.get() == "fallback"
+                                  else T("b_policy_skip")))
+        elif len(videos) == 1:
+            row["picked"] = videos[0]
+            self._set_row(ptx, video=T("b_video_ok") % (
+                videos[0].get("name", ""), videos[0].get("duration_sec", 0)),
+                status="OK")
+        else:
+            n = len(videos)
+            self._set_row(ptx, video=T("b_video_multi") % n,
+                          status=(T("b_multi_pick") + " / " + T("b_video_pick")
+                                  if self.multi_var.get() == "pick"
+                                  else T("b_multi_skip")))
+        self._invalidate_parent_preview()
+
+    def _set_row(self, ptx, video=None, status=None):
+        if not self.tree.exists(ptx):
+            return
+        vals = list(self.tree.item(ptx)["values"])
+        if video is not None:
+            vals[1] = video
+        if status is not None:
+            vals[2] = status
+        self.tree.item(ptx, values=vals)
+
+    def _pick_video(self, ptx):
+        videos = self.rows.get(ptx, {}).get("videos") or []
+        picked = self.tab._video_choose_dialog(videos)
+        if not picked:
+            return
+        self.rows[ptx]["picked"] = picked
+        self._set_row(ptx, video=T("b_video_ok") % (
+            picked.get("name", ""), picked.get("duration_sec", 0)), status="OK")
+
+    def _invalidate_parent_preview(self):
+        try:
+            self.tab._invalidate_preview()
+        except Exception:
+            pass
+
+    # ---- 生成 jobs ----
+
+    def _build_spec(self):
+        """校验对话框当前状态并构造 jobs spec dict；参数不全时弹框返回 None。
+
+        W8（v1.5.0）从 _start 中抽出：`开始执行` 与「保存任务清单」共用同一份
+        构造逻辑，保证 GUI 里跑的与存盘交给 --batch 的完全一致。
+        """
+        if not self.rows:
+            messagebox.showwarning(T("msg_invalid"), T("b_need_ptx"))
+            return None
+        tab = self.tab
+        try:
+            margin = max(float(tab.margin_var.get() or 0), 0)
+        except ValueError:
+            margin = 0
+        fallback = float(DEFAULT_FALLBACK_DURATION)
+        try:
+            fallback = max(float(tab.fallback_var.get() or DEFAULT_FALLBACK_DURATION), 1)
+        except ValueError:
+            pass
+        exclude = list(tab._exclude_pats)
+        stem_on = tab.mode_stem_var.get() == "1"
+        track_on = tab.mode_track_var.get() == "1"
+        picked_tracks = tab._selected_sources()
+        stem_aux = tab.stem_aux_var.get() == "1"
+
+        exports = []
+        modes = [m for m in EXPORT_MODES if tab._mode_on(m)]
+        if not modes:
+            messagebox.showwarning(T("msg_invalid"), T("msg_no_mode"))
+            return None
+        srcs = (tab._profile or {}).get("sources", {})
+        for m in modes:
+            if m == "mix":
+                exports.append({"kind": "output",
+                                "sources": srcs.get("output") or []})
+            elif m == "bus":
+                exports.append({"kind": "bus",
+                                "sources": srcs.get("bus") or []})
+            elif m == "stem":
+                if picked_tracks:
+                    exports.append({"kind": "track", "sources": picked_tracks})
+                else:
+                    exp = {"kind": "track-all", "exclude_empty": True,
+                           "exclude_names": exclude}
+                    if stem_aux:
+                        exp["track_types"] = ["audio", "aux", "instrument", "midi"]
+                    else:
+                        exp["skip_buses"] = True
+                    exports.append(exp)
+            elif m == "track":
+                if not picked_tracks:
+                    messagebox.showwarning(T("msg_invalid"), T("msg_no_track_sel"))
+                    return None
+                exports.append({"kind": "track", "sources": picked_tracks})
+        if any((e.get("kind") in ("output", "bus")) and not e.get("sources")
+               for e in exports):
+            messagebox.showwarning(T("msg_invalid"),
+                                   T("msg_no_output_src") if "output" in
+                                   [e.get("kind") for e in exports if not e.get("sources")]
+                                   else T("msg_no_bus_src"))
+            return None
+
+        jobs = []
+        self._fallback_used = False
+        for i, (ptx, info) in enumerate(self.rows.items(), 1):
+            job = {"id": str(i), "ptx": ptx, "session_name_expect": "",
+                   "exports": exports}
+            picked = info.get("picked")
+            videos = info.get("videos") or []
+            if picked:
+                job["duration_sec"] = round(
+                    float(picked.get("duration_sec", 0)) + margin, 3)
+            elif videos:
+                # 多视频且未选 → 用户策略：跳过记录（清单进汇总）
+                job["_videos"] = videos
+                job["skip_on_no_duration"] = True
+            else:
+                if self.no_video_var.get() == "fallback":
+                    job["duration_sec"] = fallback
+                    self._fallback_used = True
+                else:
+                    job["_videos"] = []
+                    job["skip_on_no_duration"] = True
+            jobs.append(job)
+
+        out_root = tab.out_var.get().strip()
+        if not out_root:
+            messagebox.showwarning(T("msg_invalid"), T("msg_out_missing"))
+            return None
+        spec = {
+            "defaults": {
+                "sample_rate": tab.sr_var.get(),
+                "bit_depth": tab.bd_var.get(),
+                # v1.3.0：UI 里存的是显示名，写进 jobs.json 必须是内部 key
+                "format": fmt_key_of(tab.fmt_var.get()) or DEFAULT_EXPORT_FORMAT,
+                "fps": tab._session_fps(),
+                "save_on_close": True,
+            },
+            "paths": {
+                "venv_python": tab.app.resolver.venv_python,
+                "scan_script": tab.app.resolver.script("pt-scanner"),
+                "export_script": tab.app.resolver.script("pt-exporter"),
+                "profile_dir": os.path.join(tempfile.gettempdir(),
+                                            "pt_tools_batch_profiles"),
+                "out_root": out_root,
+            },
+            "jobs": jobs,
+        }
+        return spec
+
+    def _start(self):
+        spec = self._build_spec()
+        if spec is None:
+            return
+        tab = self.tab
+        jobs = spec["jobs"]
+        os.makedirs(spec["paths"]["profile_dir"], exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix="pt_batch_jobs_")
+        jobs_path = os.path.join(tmp, "jobs.json")
+        with open(jobs_path, "w", encoding="utf-8") as f:
+            json.dump(spec, f, ensure_ascii=False, indent=2)
+        batch_script = os.path.join(tab._export_scripts_dir(),
+                                    "pt_batch_export.py")
+        cmd = [tab.app.resolver.venv_python, batch_script, "--jobs", jobs_path]
+        tab.app.log(T("b_generating") % jobs_path)
+        tab.app.log(T("b_started") % len(jobs))
+        if getattr(self, "_fallback_used", False):
+            # 兜底是"猜"的，必须显式告警（旧默认值 240s 会悄悄截断长片）
+            tab.app.log(T("e_fallback_warn") % int(fallback))
+        tab.app.start_worker([cmd])
+        self.destroy()
+
+    def _save_jobs(self):
+        """W8（v1.5.0）：把任务清单存成 jobs.json，交给 `pt-tools --batch` 夜间执行。"""
+        spec = self._build_spec()
+        if spec is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title=T("b_save_jobs"), defaultextension=".json",
+            initialfile="pt-batch-jobs.json",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(spec, f, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            messagebox.showerror(T("b_save_jobs"),
+                                 T("b_jobs_save_failed") % exc)
+            return
+        self.tab.app.log((T("b_jobs_saved") % path) + "\n")
+        messagebox.showinfo(T("b_save_jobs"), T("b_jobs_saved") % path)
+
+
+# ---------------------------------------------------------------------------
+# Tab 3 · 档案库（P3 · v1.5.0）+ 导出历史（P4）
+# ---------------------------------------------------------------------------
+
+class LibraryTab(ttk.Frame):
+    """档案库：profile_dir 平铺档案的列表 / 搜索 / 加载 / 打开 / 删除（回收站）。
+
+    档案自 v1.4.0 起按 `<工程名>-pt-profile.json` 平铺存放，本页为此而设：
+    「越攒越多、没有管理界面」的问题在这里收口。删除走 Windows 回收站
+    （PowerShell + Microsoft.VisualBasic），失败显式报错，绝不静默硬删。
+    下方「导出历史」按修改时间列出输出根里的工程文件夹（P4 最简形态）。
+    """
+
+    def __init__(self, master, app):
+        super().__init__(master, padding=PAD_LG)
+        self.app = app
+        self._rows = {}      # iid -> 档案绝对路径
+        self._hist = {}      # iid -> 输出根条目绝对路径
+        self._build()
+
+    def _build(self):
+        """v3.14.0 A2：卡片化重排（扫描页同款语言）——说明收折叠条、
+        档案库/导出历史两卡、PixelButton 执行行；rebuild_cards 换壳重建。"""
+        app = self.app
+        for w in self.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        pal = get_colors()
+        bg = pal["BG"]
+        card_cls = GlassCard if current_button_style() == "glass" else PixelCard
+
+        more = CollapsibleFrame(self, title=T("lib_what_title"), open=False)
+        more.pack(fill="x")
+        ttk.Label(more.body, text=T("lib_what_body"), wraplength=760,
+                  justify="left").pack(anchor="w", padx=4, pady=2)
+
+        # —— 卡：档案库（目录 + 搜索 + 列表 + 操作；不 expand 保历史卡进首屏）——
+        c1 = card_cls(self, title=T("lib_card_main"))
+        c1.pack(fill="x", pady=(PAD_MD, 0))
+        b1 = c1.body
+        row = tk.Frame(b1, bg=pal["SURFACE"])
+        row.pack(fill="x", padx=10, pady=(8, 4))
+        tk.Label(row, text=T("lib_dir"), bg=pal["SURFACE"],
+                 fg=pal["FG"]).pack(side="left")
+        self.var_dir = tk.StringVar(value=app.cfg.get("profile_dir", ""))
+        ttk.Label(row, textvariable=self.var_dir, style="Dim.TLabel").pack(
+            side="left", padx=6, fill="x", expand=True)
+        ttk.Button(row, text=T("lib_refresh"), width=10,
+                   command=self.refresh).pack(side="left")
+        row2 = tk.Frame(b1, bg=pal["SURFACE"])
+        row2.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Label(row2, text=T("lib_search"), bg=pal["SURFACE"],
+                 fg=pal["FG"]).pack(side="left")
+        self.var_search = tk.StringVar()
+        self.var_search.trace_add("write", lambda *a: self._reload_profiles())
+        ttk.Entry(row2, textvariable=self.var_search, width=24).pack(
+            side="left", padx=6)
+
+        tree_wrap = tk.Frame(b1, bg=pal["SURFACE"])
+        tree_wrap.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+        self.tree = ttk.Treeview(
+            tree_wrap, columns=("file", "project", "mtime", "size"),
+            show="headings", height=8)
+        self.tree.heading("file", text=T("lib_col_file"))
+        self.tree.heading("project", text=T("lib_col_project"))
+        self.tree.heading("mtime", text=T("lib_col_mtime"))
+        self.tree.heading("size", text=T("lib_col_size"))
+        self.tree.column("file", width=260)
+        self.tree.column("project", width=180)
+        self.tree.column("mtime", width=140, anchor="center", stretch=False)
+        self.tree.column("size", width=80, anchor="e", stretch=False)
+        sb = ttk.Scrollbar(tree_wrap, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", lambda _e: self._load_selected())
+        fit_tree_columns(self.tree, min_widths={"file": 140, "project": 100,
+                                                "mtime": 90, "size": 60})
+
+        btns = tk.Frame(b1, bg=pal["SURFACE"])
+        btns.pack(fill="x", padx=10, pady=(0, 8))
+        self.load_btn = PixelButton(btns, text=T("lib_load"), icon="folder",
+                                    command=self._load_selected, primary=True)
+        self.load_btn.pack(side="left")
+        self.opend_btn = PixelButton(btns, text=T("lib_open_dir"), icon="home",
+                                     command=self._open_dir)
+        self.opend_btn.pack(side="left", padx=8)
+        self.del_btn = PixelButton(btns, text=T("lib_delete"), icon="trash",
+                                   command=self._delete_selected, danger=True)
+        self.del_btn.pack(side="left")
+
+        # —— 卡：导出历史（P4）——
+        c2 = card_cls(self, title=T("lib_hist_title"))
+        c2.pack(fill="x", pady=(PAD_MD, 0))
+        hist_wrap = tk.Frame(c2.body, bg=pal["SURFACE"])
+        hist_wrap.pack(fill="x", padx=10, pady=(8, 4))
+        self.hist_tree = ttk.Treeview(hist_wrap, columns=("name", "mtime"),
+                                      show="headings", height=5)
+        self.hist_tree.heading("name", text=T("lib_col_file"))
+        self.hist_tree.heading("mtime", text=T("lib_col_mtime"))
+        self.hist_tree.column("name", width=420)
+        self.hist_tree.column("mtime", width=160, anchor="center", stretch=False)
+        hsb = ttk.Scrollbar(hist_wrap, command=self.hist_tree.yview)
+        self.hist_tree.configure(yscrollcommand=hsb.set)
+        hsb.pack(side="right", fill="y")
+        self.hist_tree.pack(side="left", fill="both", expand=True)
+        self.hist_tree.bind("<Double-1>", self._open_hist_item)
+        fit_tree_columns(self.hist_tree, min_widths={"name": 200, "mtime": 90})
+        self.openroot_btn = PixelButton(c2.body, text=T("lib_open_outroot"),
+                                        icon="folder", command=self._open_outroot)
+        self.openroot_btn.pack(side="right", padx=10, pady=(0, 8))
+
+        self.refresh()
+
+    def rebuild_cards(self):
+        """风格档案切换时换壳重建（_set_button_style 调用）。
+
+        v3.14.0 P1-5/P1-6：busy 跳过（返回 False）+ 快照/回填界面变量
+        （同 ScanTab.rebuild_cards 注记）。
+        """
+        if getattr(self, "busy", False):
+            return False
+        snap = self.app._snapshot_vars()
+        self._build()
+        self.app._restore_vars(snap)
+        return True
+
+    # ---- 档案 ----
+
+    def _reload_profiles(self):
+        self.tree.delete(*self.tree.get_children())
+        self._rows.clear()
+        d = self.var_dir.get() or ""
+        if not d or not os.path.isdir(d):
+            self.tree.insert("", "end", values=(T("lib_empty"), "", "", ""))
+            return
+        q = self.var_search.get().strip().lower()
+        try:
+            names = [n for n in os.listdir(d) if n.lower().endswith(".json")]
+        except OSError:
+            names = []
+        names.sort()
+        for name in names:
+            p = os.path.join(d, name)
+            if q and q not in name.lower():
+                continue
+            try:
+                st = os.stat(p)
+                mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
+                size = "%.1f KB" % (st.st_size / 1024.0)
+            except OSError:
+                mtime, size = "?", "?"
+            project = ""
+            try:
+                with open(p, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                project = ((data.get("session") or {}).get("name") or "").strip()
+            except Exception as exc:
+                # 档案库可能混入手改/损坏 json —— 标注但不炸（v1.5.0）
+                self.app.log(T("lib_bad_json") % name + " %s\n" % exc)
+            iid = self.tree.insert("", "end", values=(name, project, mtime, size))
+            self._rows[iid] = p
+
+    def _selected_path(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return self._rows.get(sel[0])
+
+    def _load_selected(self):
+        p = self._selected_path()
+        if not p:
+            return
+        if self.app.apply_profile(p):
+            try:
+                self.app.nb.select(1)      # 加载即切到导出页
+            except Exception:
+                pass
+
+    def _open_dir(self):
+        p = self._selected_path() or (self.var_dir.get() or "")
+        target = os.path.dirname(p) if (p and os.path.isfile(p)) else p
+        if not open_in_explorer(target):
+            messagebox.showinfo(T("menu_file"), T("no_outdir"))
+
+    def _delete_selected(self):
+        sel = [self._rows[i] for i in self.tree.selection() if i in self._rows]
+        if not sel:
+            return
+        if not messagebox.askyesno(T("lib_delete"),
+                                   T("lib_delete_confirm") % len(sel)):
+            return
+        ok = self._recycle_files(sel)
+        if ok is None:
+            self.app.log(T("lib_delete_failed") % "Recycle Bin 不可用" + "\n", "err")
+            return
+        if ok < len(sel):
+            self.app.log(T("lib_delete_failed") % "部分文件未能移入回收站" + "\n", "err")
+        self.app.log((T("lib_deleted") % ok) + "\n")
+        self._reload_profiles()
+
+    @staticmethod
+    def _recycle_files(paths):
+        """经 Windows 回收站删文件（PowerShell + VisualBasic）。
+
+        返回成功条数；PowerShell 本身不可用时返回 None（调用方显式报错，
+        绝不静默改成永久删除）。
+        """
+        import subprocess as _sp
+        from ptools.core.settings import CREATE_NO_WINDOW
+        lines = ["Add-Type -AssemblyName Microsoft.VisualBasic"]
+        for p in paths:
+            esc = str(p).replace("'", "''")
+            lines.append(
+                "try{[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile("
+                "'%s','OnlyErrorDialogs','SendToRecycleBin');'OK'}catch{'FAIL'}" % esc)
+        try:
+            proc = _sp.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "\n".join(lines)],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=60, creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            return None
+        if proc.returncode != 0:
+            return None
+        out = proc.stdout or ""
+        return out.count("OK")
+
+    # ---- 导出历史 ----
+
+    def _reload_history(self):
+        self.hist_tree.delete(*self.hist_tree.get_children())
+        self._hist.clear()
+        root = self.app.cfg.get("last_out_dir") or ""
+        if not root or not os.path.isdir(root):
+            self.hist_tree.insert("", "end", values=(T("lib_hist_empty"), ""))
+            return
+        try:
+            entries = [os.path.join(root, n) for n in os.listdir(root)]
+        except OSError:
+            entries = []
+        entries = [e for e in entries if os.path.isdir(e)]
+        entries.sort(key=lambda p: (os.path.getmtime(p) if os.path.exists(p) else 0),
+                     reverse=True)
+        for p in entries[:200]:
+            try:
+                mtime = time.strftime("%Y-%m-%d %H:%M",
+                                      time.localtime(os.path.getmtime(p)))
+            except OSError:
+                mtime = "?"
+            iid = self.hist_tree.insert("", "end",
+                                        values=(os.path.basename(p), mtime))
+            self._hist[iid] = p
+
+    def _open_hist_item(self, _e=None):
+        sel = self.hist_tree.selection()
+        p = self._hist.get(sel[0]) if sel else None
+        if p and not open_in_explorer(p):
+            messagebox.showinfo(T("menu_file"), T("no_outdir"))
+
+    def _open_outroot(self):
+        root = self.app.cfg.get("last_out_dir") or ""
+        if not open_in_explorer(root):
+            messagebox.showinfo(T("menu_file"), T("no_outdir"))
+
+    def refresh(self):
+        self.var_dir.set(self.app.cfg.get("profile_dir", ""))
+        self._reload_profiles()
+        self._reload_history()
+
+
+# ---------------------------------------------------------------------------
+# Tab 4 · 清理（骨架置灰：需 PT 2025.10+）
+# ---------------------------------------------------------------------------
+
+class CleanTab(ttk.Frame):
+    # v3.14.0 A2：卡片化重排（扫描页同款语言）——满宽 #b00 大红块 → 窄警示条
+    # （make_banner）；能力说明收折叠条；参数表收进风格卡（骨架置灰语义不变）。
+    def __init__(self, master, app):
+        super().__init__(master, padding=PAD_LG)
+        self.app = app
+        self._build()
+
+    def _build(self):
+        for w in self.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        pal = get_colors()
+        bg = pal["BG"]
+        card_cls = GlassCard if current_button_style() == "glass" else PixelCard
+
+        make_banner(self, T("c_warn"), "danger").pack(fill="x", pady=(0, 8))
+
+        more = CollapsibleFrame(self, title=T("c_cap"), open=False)
+        more.pack(fill="x")
+        ttk.Label(more.body, text=T("c_cap1")).pack(anchor="w", padx=4, pady=(2, 0))
+        ttk.Label(more.body, text=T("c_cap2"), style="Dim.TLabel").pack(
+            anchor="w", padx=4, pady=(2, 0))
+        ttk.Label(more.body, text=T("c_cap3"), style="Dim.TLabel").pack(
+            anchor="w", padx=4, pady=(2, 4))
+
+        card = card_cls(self, title=T("c_params"))
+        card.pack(fill="both", expand=True, pady=(PAD_MD, 0))
+        form = card.body
+        tk.Label(form, text=T("c_track_mode"), bg=pal["SURFACE"],
+                 fg=pal["FG"]).grid(row=0, column=0, sticky="w",
+                                    padx=10, pady=(8, 0))
+        self.track_tree = ttk.Treeview(form, columns=("name",), show="headings",
+                                       height=6)
+        self.track_tree.heading("name", text=T("c_track_col"))
+        self.track_tree.column("name", width=420)
+        self.track_tree.grid(row=1, column=0, columnspan=2, sticky="we",
+                             padx=10, pady=4)
+        fit_tree_columns(self.track_tree, min_widths={"name": 200})
+        tk.Label(form, text=T("c_target_out"), bg=pal["SURFACE"],
+                 fg=pal["FG"]).grid(row=2, column=0, sticky="w", padx=10)
+        tk.Label(form, text=T("c_backup"), bg=pal["SURFACE"],
+                 fg=pal["FG"]).grid(row=3, column=0, sticky="w",
+                                    padx=10, pady=(8, 0))
+        self.track_tree.state(["disabled"])
+        tk.Label(form, text=T("c_note"), bg=pal["SURFACE"],
+                 fg=pal["FG_DIM"]).grid(row=4, column=0, sticky="w",
+                                        padx=10, pady=(12, 8))
+
+    def rebuild_cards(self):
+        """风格档案切换时换壳重建（_set_button_style 调用）。
+
+        v3.14.0 P1-5/P1-6：busy 跳过（返回 False）+ 快照/回填界面变量
+        （同 ScanTab.rebuild_cards 注记）。
+        """
+        if getattr(self, "busy", False):
+            return False
+        snap = self.app._snapshot_vars()
+        self._build()
+        self.app._restore_vars(snap)
+        return True
+
+    def on_profile_loaded(self, data):
+        n = len(data.get("tracks", []))
+        self.track_tree.delete(*self.track_tree.get_children())
+        for t in data.get("tracks", [])[:200]:
+            self.track_tree.insert("", "end", iid=t.get("name", ""),
+                                   values=(t.get("name", ""),))
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+def main():
+    app = App()
+    _ok, _msg = app.resolver.status()
+    if not _ok:
+        messagebox.showwarning(T("skills_broken_title"),
+                               _msg + "\n\n" + T("skills_broken_hint"))
+        app.log("[warn] " + _msg + "\n")
+    app.mainloop()
